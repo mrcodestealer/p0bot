@@ -10142,6 +10142,100 @@ def _p0_minutes_tokens() -> List[Tuple[str, str]]:
     return toks
 
 
+_P0_MINUTES_DENY_RE = re.compile(r"2091005|permission|forbidden|99991|1655", re.IGNORECASE)
+
+
+def _p0_minutes_permission_hint(*blobs: str) -> List[str]:
+    """The one explanation for a denied Minutes call, or [] when the error is something else.
+
+    Worth stating plainly because every instinct here is wrong: a 妙记 cannot be shared to an app
+    the way a cloud doc can, so granting scopes and sharing the doc changes nothing. The call has
+    to run as a user who can already open that particular minute — in practice its owner, the
+    meeting host. ``/whotalk`` says the same thing; this keeps the wording in one place.
+    """
+    blob = " ".join(b or "" for b in blobs)
+    if not _P0_MINUTES_DENY_RE.search(blob):
+        return []
+    return [
+        "妙记**不能**像云文档那样分享给应用/机器人，所以租户 token 永远读不到 —— 必须由**这篇妙记的"
+        "所有者（会议主持人）**本人跑一次 `/vcauth` → `/vccode`。",
+        "Minutes can NOT be shared to an app/bot the way cloud docs can, so the tenant token can "
+        "never read them: the **owner (the meeting host)** of THIS minute has to be the one who "
+        "runs `/vcauth` → `/vccode`.",
+        "已授权仍被拒：确认授权的人正是这篇妙记的所有者，并检查该妙记「谁可以下载视频、导出妙记」的"
+        "设置（所有者不受限制）。/ Authorized and still denied: check that whoever authorized really "
+        "owns this minute, and check its \"who can download video / export minutes\" setting "
+        "(the owner is never restricted).",
+    ]
+
+
+def _p0_minutes_denied_identity(minute_token: str) -> List[str]:
+    """The two names that actually decide a 2091005: who owns the minute, and who /vcauth stored.
+
+    Only worth calling on the denial path. Both lookups are best-effort — the info endpoint can be
+    denied just like the transcript one — but when they do resolve they turn "ask around who hosted
+    it" into a name, which is the only thing standing between the user and a fix.
+    """
+    lines: List[str] = []
+    owner, owner_name = "", ""
+    for _kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.get(
+                f"{_lark_api_domain()}/open-apis/minutes/v1/minutes/{minute_token}",
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=20,
+            )
+            j = r.json()
+        except Exception:
+            continue
+        if int(j.get("code", -1)) == 0:
+            m = (j.get("data") or {}).get("minute") or {}
+            owner = _lark_dict_pick_str(m, "owner_id", "ownerId")
+            if owner:
+                break
+    if owner:
+        try:
+            owner_name = _p0_contact_name(owner)
+        except Exception:
+            logger.info("p0 minutes owner name lookup failed for %r", owner[:20])
+        lines.append(f"妙记所有者 / minute owner: **{owner_name or '?'}** `{owner}`")
+    else:
+        lines.append("妙记所有者 / minute owner: 读不到（基本信息接口也被拒）/ unknown "
+                     "(the minute-info endpoint is denied too)")
+
+    who, who_id = "", ""
+    ut = _p0_vc_user_access_token()
+    if ut:
+        try:
+            r = requests.get(
+                f"{_lark_api_domain()}/open-apis/authen/v1/user_info",
+                headers={"Authorization": f"Bearer {ut}"},
+                timeout=20,
+            )
+            j = r.json()
+            if int(j.get("code", -1)) == 0:
+                d = j.get("data") or {}
+                who = _lark_dict_pick_str(d, "name", "en_name")
+                who_id = _lark_dict_pick_str(d, "open_id", "openId")
+        except Exception:
+            logger.info("p0 vcauth user_info lookup failed")
+    if who or who_id:
+        lines.append(f"当前 /vcauth 身份 / authorized as: **{who or '?'}** `{who_id or '?'}`")
+    else:
+        lines.append("当前 /vcauth 身份 / authorized as: 无法确认（令牌缺失或已失效）/ "
+                     "cannot confirm (token missing or expired)")
+    if owner and who_id and owner != who_id:
+        lines.append(f"→ **不是同一个人**：需要 **{owner_name or owner}** 本人跑一次 `/vcauth` → "
+                     f"`/vccode`（会覆盖当前令牌）。/ **Different people** — "
+                     f"**{owner_name or owner}** has to run `/vcauth` → `/vccode` themselves "
+                     f"(it overwrites the stored token).")
+    elif owner and who_id and owner == who_id:
+        lines.append("→ 所有者与授权身份一致，那就是妙记里「谁可以下载视频、导出妙记」的设置在拦。/ "
+                     "Owner and authorized identity match, so it is the minute's own "
+                     "\"who can download / export\" setting blocking this.")
+    return lines
+
+
 def _p0_minutes_export(minute_token: str, params: Dict[str, Any], what: str) -> Tuple[bytes, Dict[str, Any]]:
     """(file_bytes, error) from the transcript-export endpoint (binary stream on success)."""
     last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
@@ -10645,7 +10739,9 @@ def _p0_whotalk_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_
                         "them. The minute's **owner (the meeting host)** must authorize once via /vcauth → /vccode. "
                         "If already authorized and still denied: check the minute's \"who can download/export\" setting "
                         "(the owner is always allowed).")
-            _fail([f"导出转写失败 / transcript export failed: `code={terr.get('code')}  msg={terr.get('msg')}`{hint}"])
+            _fail([f"导出转写失败 / transcript export failed: "
+                   f"`code={terr.get('code')}  msg={terr.get('msg')}`{hint}"]
+                  + (_p0_minutes_denied_identity(token) if hint else []))
             return
         if rt and rv:
             _lark_send_text_auto(rt, rv,
@@ -12689,9 +12785,12 @@ def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key:
         transcript, src, media_path, duration, tnotes = _p0_ose_transcript(
             token, workdir, start_epoch)
         if not transcript:
+            deny = _p0_minutes_permission_hint(*tnotes)
             _card("⚠️ 无法取得转写 / transcript unavailable", "red",
                   [f"妙记 minutes token: `{token}`"]
                   + [f"• {n}" for n in tnotes]
+                  + deny
+                  + (_p0_minutes_denied_identity(token) if deny else [])
                   + [f"用同一个会议试 `{_p0_whotalk_trigger()} {meeting_arg or token}`——"
                      f"它也失败就是权限/会议的问题，不是本命令的问题。/ Try "
                      f"`{_p0_whotalk_trigger()} {meeting_arg or token}` on the same meeting: if that "
@@ -13259,10 +13358,24 @@ def _p0_vcauth_worker(kind: str, arg: str, rt: str, rv: str, debounce_key: str) 
                 "/vccode <粘贴 code 或整个跳转网址 / paste the code, or the whole redirected URL>"
             )
         else:  # kind == "code"
-            code = (arg or "").strip()
-            m = re.search(r"code=([^&\s]+)", code)
+            # Accept every shape the code arrives in. The old version only cut the query string
+            # when the text still contained "code=", so a bare code copied together with the rest
+            # of it ("9ELv…Tb&state=d20c…") was posted to Lark verbatim and came back as
+            # "authorization code is not found" — which reads like an expired code, not a typo.
+            code = (arg or "").strip().strip("<>`\"'“”‘’ ")
+            m = re.search(r"[?&]?\bcode=([^&\s]+)", code)
             if m:
                 code = m.group(1)
+            else:
+                # "<code>&state=…" / "<code>?foo" / "<code> trailing words"
+                code = re.split(r"[&?\s]", code, 1)[0]
+            code = code.strip().rstrip(",.;")
+            if not code:
+                _reply("⚠️ 没读到 code / no code found in that message.\n"
+                       "用法 / usage: `/vccode <code 或整个跳转网址 / the code, or the whole "
+                       "redirected URL>`")
+                return
+            logger.info("p0 vcauth exchanging code=%r (from arg %r)", code[:8] + "…", arg[:80])
             ok, msg = _p0_vc_oauth_exchange(code)
             if ok:
                 _reply(
