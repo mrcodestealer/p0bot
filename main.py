@@ -530,7 +530,17 @@ _CFG: Dict[str, Any] = {
     # redirect_uri must be registered in the app's Security → Redirect URLs (localhost is fine;
     # the code is copied from the address bar, so the URL need not actually be served).
     "P0_VC_REDIRECT_URI": "http://localhost:5088/oauth/callback",
-    "P0_VC_OAUTH_SCOPES": "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly contact:user.employee_id:readonly",
+    # Scopes requested by /vcauth. THIS value wins over the inline default in
+    # _p0_vc_oauth_scopes() (_cfg_str only falls back when the key is absent/empty), so the
+    # minutes:* scopes have to be listed HERE or the user token comes back unable to touch the
+    # Minutes API — every transcript/SRT/media call then answers `2091005 permission deny`.
+    #   minutes.transcript:export -> /minutes/v1/minutes/{t}/transcript  (/whotalk, /p0docs, /osemeeting)
+    #   minutes.media:export      -> /minutes/v1/minutes/{t}/media       (recording download: local ASR,
+    #                                                                     OpenAI ASR, the vision pass)
+    #   minutes.basic:read        -> /minutes/v1/minutes/{t}             (title / start / duration)
+    # Adding a scope here is not enough on its own: grant it in the Developer Console, PUBLISH a
+    # new app version, then re-run /vcauth — an already-minted token never gains scopes.
+    "P0_VC_OAUTH_SCOPES": "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly contact:user.employee_id:readonly minutes:minutes.transcript:export minutes:minutes.media:export minutes:minutes.basic:read",
     # REQUIRED to use /vcauth //vccode: space/comma-separated admin open_ids allowed to authorize
     # (the stored token is shared, so a stray authorize would clobber it). Empty = nobody
     # (fail-closed); run /vcauth once and the bot replies with your open_id — set it here + restart.
@@ -12597,7 +12607,7 @@ def _p0_ose_transcript(minute_token: str, workdir: str,
     if text:
         return text, "Lark ASR (timed)", media_path, duration, notes
     notes.append("Lark SRT 导出 / SRT export: 空 / empty "
-                 "(需 scope minutes:minutes.transcript + /vcauth)")
+                 "(需 scope minutes:minutes.transcript:export + 重跑 /vcauth)")
     text, terr = _p0_minutes_transcript(minute_token)
     if text:
         return text, "Lark ASR", media_path, duration, notes
