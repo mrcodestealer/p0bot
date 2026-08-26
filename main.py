@@ -12509,19 +12509,25 @@ def _p0_ose_retitle(document_id: str, items: List[Dict[str, Any]], date_str: str
 # ---- the worker ------------------------------------------------------------------------------
 
 def _p0_ose_transcript(minute_token: str, workdir: str,
-                       start_epoch: float) -> Tuple[str, str, str, float]:
-    """(transcript, source label, media path, duration).
+                       start_epoch: float) -> Tuple[str, str, str, float, List[str]]:
+    """(transcript, source label, media path, duration, per-stage failure notes).
 
     OpenAI ASR first (audio heard fresh, speaker names borrowed from the Minutes SRT), then the
     local engine, then Lark's own text. The media is downloaded once and handed back so the
     vision pass can reuse it instead of pulling the recording twice.
+
+    Every stage that declines or fails appends a note. When the whole chain comes up empty those
+    notes ARE the diagnosis, so they are handed to the caller for the error card instead of only
+    going to the journal — "everything failed" on its own is not something anyone can act on.
     """
     provider = (_cfg_str("P0_OSEMEETING_ASR_PROVIDER", "openai").strip().lower() or "openai")
+    notes: List[str] = []
     media_path, duration = "", 0.0
     if provider == "openai" and _p0_ose_openai_key():
         media_path, derr = _p0_ose_download_media(minute_token, workdir)
         if not media_path:
             logger.warning("p0 osemeeting recording download failed: %s", derr)
+            notes.append(f"录像下载 / recording download: {derr}")
         else:
             duration = _p0_ose_media_duration(media_path)
             segments, aerr = _p0_ose_openai_segments(media_path, workdir)
@@ -12540,32 +12546,45 @@ def _p0_ose_transcript(minute_token: str, workdir: str,
                     return (_p0_ose_speakered(segments, turns, start_epoch),
                             f"OpenAI ASR + Minutes speaker names "
                             f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
-                            media_path, duration)
+                            media_path, duration, notes)
                 # No speaker labels to borrow — still far better than nothing, just unattributed.
                 lines = [f"[{_p0_ose_hhmmss(s['start'], start_epoch)}] {s['text']}"
                          for s in segments]
                 return ("\n".join(lines),
                         f"OpenAI ASR, no speaker labels "
                         f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
-                        media_path, duration)
+                        media_path, duration, notes)
             logger.warning("p0 osemeeting OpenAI ASR failed — falling back: %s", aerr)
+            notes.append(f"OpenAI ASR: {aerr}")
     elif provider == "openai":
         logger.info("p0 osemeeting: no OpenAI key configured — falling back to the local/Lark path")
+        notes.append("OpenAI ASR: 未配置 API key / no API key "
+                     "(P0_OSEMEETING_OPENAI_API_KEY or OPENAI_API_KEY)")
+    else:
+        notes.append(f"OpenAI ASR: 已按 P0_OSEMEETING_ASR_PROVIDER={provider} 跳过 / skipped")
 
     if provider in ("openai", "local") and _p0_whotalk_asr_enabled():
         text, aerr = _p0_whotalk_local_transcribe(minute_token, with_times=True,
                                                   start_epoch=start_epoch)
         if text:
-            return text, f"本地识别 local ASR ({_p0_whotalk_asr_engine()})", media_path, duration
+            return (text, f"本地识别 local ASR ({_p0_whotalk_asr_engine()})",
+                    media_path, duration, notes)
         logger.warning("p0 osemeeting local ASR failed: %s", aerr)
+        notes.append(f"本地识别 local ASR: {aerr}")
+    else:
+        notes.append("本地识别 local ASR: 未启用 / disabled (P0_WHOTALK_ASR_ENABLE=0)")
+
     text = _p0_srt_timed_transcript(minute_token, start_epoch)
     if text:
-        return text, "Lark ASR (timed)", media_path, duration
+        return text, "Lark ASR (timed)", media_path, duration, notes
+    notes.append("Lark SRT 导出 / SRT export: 空 / empty "
+                 "(需 scope minutes:minutes.transcript + /vcauth)")
     text, terr = _p0_minutes_transcript(minute_token)
     if text:
-        return text, "Lark ASR", media_path, duration
+        return text, "Lark ASR", media_path, duration, notes
     logger.info("p0 osemeeting: no transcript at all: %s", terr)
-    return "", "", media_path, duration
+    notes.append(f"Lark 转写 / transcript: code={terr.get('code')} msg={terr.get('msg')}")
+    return "", "", media_path, duration, notes
 
 
 def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
@@ -12638,11 +12657,16 @@ def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key:
              f"文档 doc: `{document_id}` · 妙记 minutes: `{token}`\n"
              f"模板槽位 template slots: EN {slots_en} · 中文 {slots_zh}")
 
-        transcript, src, media_path, duration = _p0_ose_transcript(token, workdir, start_epoch)
+        transcript, src, media_path, duration, tnotes = _p0_ose_transcript(
+            token, workdir, start_epoch)
         if not transcript:
             _card("⚠️ 无法取得转写 / transcript unavailable", "red",
-                  ["音频识别与 Lark 转写都失败了 / both ASR and the Lark transcript failed",
-                   "参考 /whotalk 的权限要求 / see the /whotalk permission requirements"])
+                  [f"妙记 minutes token: `{token}`"]
+                  + [f"• {n}" for n in tnotes]
+                  + [f"用同一个会议试 `{_p0_whotalk_trigger()} {meeting_arg or token}`——"
+                     f"它也失败就是权限/会议的问题，不是本命令的问题。/ Try "
+                     f"`{_p0_whotalk_trigger()} {meeting_arg or token}` on the same meeting: if that "
+                     f"fails too the problem is the scopes or the meeting, not this command."])
             return
         teams = _p0_transcript_speaker_teams(transcript)
         if teams:
