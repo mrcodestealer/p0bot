@@ -289,14 +289,20 @@ _CFG: Dict[str, Any] = {
     "MONITORING_AI_PROMPT": "",
     "JUNCHEN": "",
     "MONITORING_ALERT_CHAT_ID": "oc_51b6fbf2636525acfb4ead3afa3c93ce",
-    # @ bot + "git pull … and restart …" — git pull origin main then systemctl restart (authorized user only)
+    # @ bot + "git pull … and restart …" (or "/deploy") — git pull origin main then
+    # systemctl restart, for authorized senders only.
     "DEPLOY_ENABLE": "1",
-    "DEPLOY_ALLOWED_USER_OPEN_ID": "ou_c2b8722767f4c17df35edc1b2fbcc55a",
+    # DELIBERATELY EMPTY on this fork. An open_id is scoped to the APP that saw it, so the
+    # grafanagamebot-namespace id this file used to ship could never match under p0bot's
+    # credentials — deploy just answered "not authorized" forever. Empty means fail-closed
+    # (nobody can deploy), and the denial reply prints the sender's own p0bot-namespace id so
+    # it can be pasted straight in here. `/whoami` prints the same id on demand.
+    "DEPLOY_ALLOWED_USER_OPEN_ID": "",
     # Optional extra allow-list (space/comma separated open_ids)
     "DEPLOY_ALLOWED_USER_OPEN_IDS": "",
     # Empty = directory containing this main.py; override on server if repo lives elsewhere
     "DEPLOY_GIT_REPO_PATH": "",
-    "DEPLOY_SYSTEMD_SERVICE": "grafanagamebot",
+    "DEPLOY_SYSTEMD_SERVICE": "p0bot",
     "DEPLOY_TRIGGER": "/deploy",
     # ---- p0bot: Lark wiki doc Q&A via local Ollama / Qwen ----
     # Read a Lark wiki page (and, optionally, its whole subtree), cache the plain
@@ -920,7 +926,7 @@ for _dep_uid in re.split(
     if _dep_uid.strip():
         DEPLOY_ALLOWED_USER_OPEN_ID_SET.add(_dep_uid.strip())
 DEPLOY_GIT_REPO_PATH = _cfg_str("DEPLOY_GIT_REPO_PATH", "").strip()
-DEPLOY_SYSTEMD_SERVICE = _cfg_str("DEPLOY_SYSTEMD_SERVICE", "grafanagamebot").strip()
+DEPLOY_SYSTEMD_SERVICE = _cfg_str("DEPLOY_SYSTEMD_SERVICE", "p0bot").strip()
 DEPLOY_TRIGGER = _cfg_str("DEPLOY_TRIGGER", "/deploy").strip()
 _DEPLOY_REQUEST_RE = re.compile(r"git\s+pull\b.*\brestart\b", re.IGNORECASE)
 MONITORING_ALERT_AT_USER_NOTE = _cfg_str(
@@ -4821,7 +4827,7 @@ def _deploy_run_cmd(
 
 def _deploy_schedule_service_restart(svc: str, delay_sec: float = 2.0) -> None:
     """Restart after a short delay so Lark can deliver the final Done message first."""
-    name = (svc or "grafanagamebot").strip() or "grafanagamebot"
+    name = (svc or "p0bot").strip() or "p0bot"
     delay = max(1.0, min(15.0, float(delay_sec)))
     cmd = f"sleep {int(delay)} && systemctl restart {shlex.quote(name)}"
     subprocess.Popen(
@@ -4842,7 +4848,7 @@ def _deploy_git_pull_restart_worker(chat_id: str, open_id: str, debounce_key: st
 
     try:
         repo = _deploy_git_repo_path()
-        svc = (DEPLOY_SYSTEMD_SERVICE or "grafanagamebot").strip() or "grafanagamebot"
+        svc = (DEPLOY_SYSTEMD_SERVICE or "p0bot").strip() or "p0bot"
         _reply(f"Starting `git pull origin main` in `{repo}` …")
         rc, out = _deploy_run_cmd(["git", "pull", "origin", "main"], cwd=repo, timeout=300)
         tail = "\n".join((out or "").splitlines()[-12:])
@@ -4901,7 +4907,7 @@ def _deploy_try_handle_im_message(
         logger.warning("deploy-like message but DEPLOY_ENABLE=0")
         if _deploy_sender_authorized(sender, open_id or "", send_wrap):
             try:
-                _deploy_reply(chat_id, open_id, "Deploy (Grafana Game Bot): disabled (DEPLOY_ENABLE=0).")
+                _deploy_reply(chat_id, open_id, "🚀 Deploy (p0bot): disabled (DEPLOY_ENABLE=0).")
             except Exception:
                 logger.exception("deploy disabled feedback failed")
         return True
@@ -4915,12 +4921,18 @@ def _deploy_try_handle_im_message(
             sorted(DEPLOY_ALLOWED_USER_OPEN_ID_SET),
         )
         try:
+            # open_ids are per-app, so the id below is the ONLY one that works here — print it
+            # in full so it can be pasted straight into .env instead of guessed at.
             _deploy_reply(
                 chat_id,
                 open_id,
-                f"Deploy (Grafana Game Bot): not authorized.\n"
-                f"Your Feishu id: `{primary}`\n"
-                f"Allowed: `{next(iter(DEPLOY_ALLOWED_USER_OPEN_ID_SET), '')}`",
+                "🚫 Deploy (p0bot): not authorized.\n"
+                f"Your p0bot open_id: `{primary}`\n"
+                + (f"Allowed: `{', '.join(sorted(DEPLOY_ALLOWED_USER_OPEN_ID_SET))}`"
+                   if DEPLOY_ALLOWED_USER_OPEN_ID_SET
+                   else "Allowed: (nobody yet — DEPLOY_ALLOWED_USER_OPEN_ID is empty)")
+                + "\nTo allow yourself: put that id in `DEPLOY_ALLOWED_USER_OPEN_ID` in "
+                  "`/root/p0bot/.env`, then `systemctl restart p0bot`.",
             )
         except Exception:
             logger.exception("deploy unauthorized feedback failed")
@@ -4938,8 +4950,8 @@ def _deploy_try_handle_im_message(
             _deploy_reply(
                 chat_id,
                 open_id,
-                "Deploy (Grafana Game Bot): please @ **Grafana Game Bot** (not Platform), "
-                "then send `/deploy` or: git pull origin main and restart service",
+                "🚀 Deploy (p0bot): please @ **p0bot** in this group, then send "
+                "`/deploy` — or: git pull origin main and restart service",
             )
         except Exception:
             logger.exception("deploy @-gate feedback failed")

@@ -186,6 +186,45 @@ the app as **editable**. If the bot can't write the doc, it posts the filled con
 for manual pasting instead. Order of the two links doesn't matter; leave the meeting part
 empty to use the last bot-recorded meeting.
 
+## Deploy from chat — @p0bot "git pull origin main and restart service"
+
+@-mention the bot in a group (or just DM it) and say either of these:
+
+```
+@p0bot git pull origin main and restart service
+@p0bot /deploy
+```
+
+Any phrasing that contains **`git pull` … `restart`** matches (`_DEPLOY_REQUEST_RE`), so
+"pull and restart", "git pull origin main then restart the service" all work. The bot replies
+`OK`, runs `git pull origin main` in the repo, posts the git output, then restarts the systemd
+service ~2 s later — detached via `bash -c "sleep 2 && systemctl restart …"`, so the final
+"Done" message is delivered *before* the process kills itself.
+
+Three gates, all of which must pass:
+
+1. `DEPLOY_ENABLE=1` (default on).
+2. **The sender is allow-listed.** `DEPLOY_ALLOWED_USER_OPEN_ID` — deploy is **fail-closed**:
+   with it empty, nobody can deploy.
+3. **The bot was actually @-mentioned** (skipped in DMs).
+
+> **Set the allow-list first — an open_id is scoped to the app that saw it.** An id copied from
+> another bot in the same tenant will *never* match here, which used to make this feature look
+> broken. Send `/whoami` to p0bot to get your p0bot-namespace `ou_…`, or simply try to deploy:
+> the "not authorized" reply prints your id ready to paste into
+> `DEPLOY_ALLOWED_USER_OPEN_ID` in `/root/p0bot/.env`. Then `systemctl restart p0bot` once by
+> hand — after that, chat deploys work.
+
+Startup logs the resolved config, so you can confirm it without a test deploy:
+
+```
+DEPLOY git-restart: enable=True trigger='/deploy' allowed_user=… service=p0bot
+```
+
+The service runs as `root` (see `p0bot.service`), so `systemctl restart` needs no `sudo`. Note
+that `contacts.csv` and the wiki cache reload on their own — a deploy is only needed for
+`main.py` changes.
+
 ## Write the OSE / weekly meeting minutes ("/osemeeting")
 
 ```
