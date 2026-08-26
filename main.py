@@ -423,6 +423,67 @@ _CFG: Dict[str, Any] = {
     "P0_P0DOCS_USE_LOCAL_ASR": "0",
     # Max transcript characters passed to the fill model (head+tail kept when longer).
     "P0_P0DOCS_TRANSCRIPT_CHARS": "12000",
+    # ---- /osemeeting — write the bilingual OSE/weekly meeting minutes doc from a recording ----
+    # Usage (either order, one per line):
+    #   /osemeeting
+    #   <meeting link|9-digit no|minutes link>
+    #   <wiki/docx doc link>
+    # Three models in one pass: OpenAI ASR hears the audio, qwen2.5vl watches the video and keeps
+    # only the frames that carry information (shared screens, dashboards, errors, configs), and
+    # qwen3.6:35b-a3b turns both into the doc's own layout — the Overview table plus the
+    # "English Version" / "中文版" numbered discussion topics, with the kept frames embedded
+    # under the topic they belong to.
+    # Needs scope docx:document (edit; add + PUBLISH) with the doc shared to the app as EDITABLE,
+    # minutes:minutes.media:export for the recording download, and drive:drive to upload images.
+    "P0_OSEMEETING_ENABLE": "1",
+    "P0_OSEMEETING_TRIGGER": "/osemeeting",
+    # ---- audio → text: OpenAI ASR, falling back to the local engine, then Lark's own text ----
+    # openai | local | lark. "openai" still falls back down the chain on any failure.
+    "P0_OSEMEETING_ASR_PROVIDER": "openai",
+    # Empty = read OPENAI_API_KEY from the environment instead.
+    "P0_OSEMEETING_OPENAI_API_KEY": "",
+    "P0_OSEMEETING_OPENAI_BASE_URL": "https://api.openai.com/v1",
+    # whisper-1 by default because it is the only transcription model that still returns per-segment
+    # timestamps (response_format=verbose_json), and those timestamps are what let the bot line each
+    # sentence up with the right speaker from the Minutes SRT. gpt-4o-transcribe returns text only,
+    # so with it speaker attribution degrades to "this chunk = whoever spoke most in it".
+    "P0_OSEMEETING_OPENAI_ASR_MODEL": "whisper-1",
+    # Force a base language (ISO-639-1, e.g. zh / en); empty = let the model auto-detect.
+    "P0_OSEMEETING_ASR_LANG": "",
+    "P0_OSEMEETING_ASR_PROMPT": "Mixed Chinese/English OSE operations meeting. Keep English technical terms in English; write Chinese speech in 汉字.",
+    # A single OpenAI request is hard-capped at 25 MB, so the audio is cut into chunks first.
+    # 600 s of 32 kbps mono mp3 is ~2.4 MB — far under the cap even for a long meeting.
+    "P0_OSEMEETING_ASR_CHUNK_SECONDS": "600",
+    "P0_OSEMEETING_ASR_BITRATE": "32k",
+    "P0_OSEMEETING_ASR_TIMEOUT_SECONDS": "300",
+    # ---- video → pictures: qwen2.5vl keeps the frames worth putting in the doc ----
+    "P0_OSEMEETING_VISION_ENABLE": "1",
+    "P0_OSEMEETING_VISION_MODEL": "qwen2.5vl:3b",
+    # Sample one frame every N seconds; near-identical consecutive frames are dropped before the
+    # model ever sees them (a screen share that sits still for 5 minutes costs one look, not 15).
+    "P0_OSEMEETING_FRAME_INTERVAL_SECONDS": "20",
+    "P0_OSEMEETING_FRAME_WIDTH": "1280",
+    # Mean 0..255 pixel distance (on a 16x16 grey thumbnail) below which two sampled frames count
+    # as the same screen. Raise it to dedupe harder, lower it to keep subtler changes.
+    "P0_OSEMEETING_FRAME_DEDUPE_THRESHOLD": "3.0",
+    # Hard caps: distinct frames shown to the vision model, and images finally embedded in the doc.
+    "P0_OSEMEETING_MAX_FRAMES": "120",
+    "P0_OSEMEETING_MAX_IMAGES": "8",
+    "P0_OSEMEETING_VISION_TIMEOUT_SECONDS": "120",
+    "P0_OSEMEETING_VISION_PROMPT": "",
+    # ---- text → minutes: the writer model (empty = P0_QA_MODEL / MONITORING_AI_MODEL) ----
+    "P0_OSEMEETING_WRITER_MODEL": "",
+    "P0_OSEMEETING_PROMPT": "",
+    # Max transcript characters handed to the writer (head+tail kept when longer).
+    "P0_OSEMEETING_TRANSCRIPT_CHARS": "24000",
+    # Max discussion topics written per language section (the template ships with 4 slots; extra
+    # topics get new headings appended, unused slots are left untouched).
+    "P0_OSEMEETING_MAX_TOPICS": "10",
+    # Overview table values the meeting itself cannot supply. Empty "prepared by" = the bot's name.
+    "P0_OSEMEETING_PREPARED_BY": "",
+    "P0_OSEMEETING_PARTICIPANTS_FALLBACK": "MY OSE",
+    # Keep the downloaded recording + extracted frames for debugging (default: delete after use).
+    "P0_OSEMEETING_KEEP_MEDIA": "0",
     # OSE duty roster (wiki sheet): months in row 1, day numbers in row 2, names in column A,
     # D/N marks per day. Meeting start 07:00-19:00 → that day's D people; otherwise N (a start
     # before 07:00 belongs to the previous day's N shift). Fills "OSE On-duty".
@@ -9460,6 +9521,7 @@ def _p0_try_handle_doc_qa(
         or _p0_command_body(text_clean, _p0_checkmeeting_trigger()) is not None
         or _p0_command_body(text_clean, _p0_whotalk_trigger()) is not None
         or _p0_command_body(text_clean, _p0_p0docs_trigger()) is not None
+        or _p0_command_body(text_clean, _p0_ose_trigger()) is not None
         or _p0_command_body(text_clean, "/vcauth") is not None
         or _p0_command_body(text_clean, "/vccode") is not None
         or _p0_command_body(text_clean, "/whoami") is not None
@@ -11601,6 +11663,1119 @@ def _p0_try_handle_p0docs(
         ).start()
     except Exception:
         logger.exception("p0 p0docs worker thread failed to start")
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# p0bot — "/osemeeting": write the bilingual OSE / weekly meeting minutes doc
+#
+#   /osemeeting
+#   <meeting link|9-digit no|minutes link>
+#   <wiki/docx doc link>
+#
+# The two links may be given in either order (the doc is recognised by its
+# /wiki/ or /docx/ path; everything else on the line is the meeting reference).
+#
+# Three models, one pass over one download:
+#   * OpenAI ASR (whisper-1) hears the audio and returns timed segments; speaker
+#     names come from the Minutes SRT and are matched onto those segments by time
+#     overlap, so every line ends up as "[HH:MM:SS] Name: text".
+#   * qwen2.5vl:3b watches the video — frames are sampled, near-duplicates are
+#     dropped before the model sees them, and it decides which of the survivors
+#     actually carry information (shared screens, dashboards, errors, configs).
+#   * qwen3.6:35b-a3b turns the transcript + the frame captions into the doc's own
+#     layout: the Overview table, then numbered discussion topics written twice —
+#     once under "English Version", once under "中文版" — with the kept frames
+#     embedded under the topic they belong to.
+#
+# Everything degrades instead of failing: no OpenAI key -> local ASR -> Lark's own
+# text; no ffmpeg/video -> text-only minutes; a block that will not patch is
+# counted and reported rather than aborting the run.
+# ---------------------------------------------------------------------------
+
+_P0_OSE_NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣",
+                     "5️⃣", "6️⃣", "7️⃣", "8️⃣",
+                     "9️⃣", "\U0001f51f"]
+
+# A heading that is a topic slot: "1️⃣ …", "1. …", "1) …", or a bare number.
+_P0_OSE_NUMBERED_RE = re.compile(
+    r"^\s*(?:([1-9]️?⃣|\U0001f51f)|([1-9][0-9]?)\s*[.)、]?)\s*"
+)
+
+# Section splitters inside the minutes doc.
+_P0_OSE_EN_SECTION_RE = re.compile(r"english\s*version|^\s*english\s*$", re.IGNORECASE)
+_P0_OSE_ZH_SECTION_RE = re.compile(r"中文版|中文版本|chinese\s*version", re.IGNORECASE)
+
+# Overview-table labels -> which value the bot writes into the cell after them.
+_P0_OSE_OVERVIEW_LABELS = (
+    ("date", ("date", "日期", "會議日期", "会议日期")),
+    ("participants", ("participants", "participant", "attendees", "参与人", "參與人",
+                      "出席人员", "出席人員", "参加人", "參加人")),
+    ("prepared_by", ("prepared by", "prepared", "记录人", "記錄人", "撰写人", "撰寫人",
+                     "整理人")),
+)
+
+
+def _p0_ose_enabled() -> bool:
+    return _lark_env_truthy_or_default("P0_OSEMEETING_ENABLE", default=True)
+
+
+def _p0_ose_trigger() -> str:
+    return _cfg_str("P0_OSEMEETING_TRIGGER", "/osemeeting").strip() or "/osemeeting"
+
+
+def _p0_ose_openai_key() -> str:
+    return (_cfg_str("P0_OSEMEETING_OPENAI_API_KEY", "").strip()
+            or os.environ.get("OPENAI_API_KEY", "").strip())
+
+
+def _p0_ose_writer_model() -> str:
+    return _cfg_str("P0_OSEMEETING_WRITER_MODEL", "").strip() or _p0_qa_model()
+
+
+def _p0_ose_hhmmss(seconds: float, start_epoch: float) -> str:
+    """HH:MM:SS wall clock when the meeting start is known, else relative to the recording."""
+    if start_epoch:
+        return time.strftime("%H:%M:%S", time.localtime(start_epoch + max(0.0, seconds)))
+    s = int(max(0.0, seconds))
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def _p0_ffprobe_bin() -> str:
+    """ffprobe sitting next to the configured ffmpeg, else PATH."""
+    fb = _p0_ffmpeg_bin()
+    if fb and os.path.sep in fb:
+        cand = os.path.join(os.path.dirname(fb), "ffprobe")
+        for c in (cand, cand + ".exe"):
+            if os.path.isfile(c):
+                return c
+    return "ffprobe"
+
+
+def _p0_ose_media_duration(media_path: str) -> float:
+    """Duration in seconds; 0.0 when it cannot be determined."""
+    try:
+        proc = subprocess.run(
+            [_p0_ffprobe_bin(), "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", media_path],
+            capture_output=True, timeout=120,
+        )
+        if proc.returncode == 0:
+            return max(0.0, float((proc.stdout or b"").decode("utf-8", "replace").strip()))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    # ffprobe does not ship with every ffmpeg build — read it off ffmpeg's own banner instead.
+    try:
+        proc = subprocess.run([_p0_ffmpeg_bin(), "-i", media_path],
+                              capture_output=True, timeout=120)
+        m = re.search(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)",
+                      (proc.stderr or b"").decode("utf-8", "replace"))
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    return 0.0
+
+
+def _p0_ose_download_media(minute_token: str, workdir: str) -> Tuple[str, str]:
+    """(path to the downloaded recording, error). Tries the URL presigned, then with our tokens."""
+    media_url, merr = _p0_minutes_media_url(minute_token)
+    if not media_url:
+        return "", (f"media download-url failed: code={merr.get('code')} msg={merr.get('msg')} "
+                    "(scope minutes:minutes.media:export granted+published? re-/vcauth after adding it)")
+    media_path = os.path.join(workdir, "media.bin")
+    max_mb = _cfg_int("P0_WHOTALK_ASR_MAX_MEDIA_MB", 1024)
+    auth_headers: List[Dict[str, str]] = [{}]
+    auth_headers += [{"Authorization": f"Bearer {tok}"} for _kind, tok in _p0_minutes_tokens()]
+    written, last_status = 0, "?"
+    for hdrs in auth_headers:
+        try:
+            with requests.get(media_url, headers=hdrs, stream=True, timeout=180) as r:
+                last_status = str(r.status_code)
+                if r.status_code in (401, 403):
+                    continue
+                r.raise_for_status()
+                clen = int(r.headers.get("Content-Length") or 0)
+                if max_mb and clen and clen > max_mb * 1024 * 1024:
+                    return "", f"recording too large ({clen // (1024 * 1024)} MB > {max_mb} MB limit)"
+                written = 0
+                with open(media_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
+                        written += len(chunk)
+                        if max_mb and written > max_mb * 1024 * 1024:
+                            return "", f"recording exceeded the {max_mb} MB download limit"
+        except Exception as e:
+            last_status = e.__class__.__name__
+            continue
+        break
+    if not written:
+        return "", f"media download denied (HTTP {last_status}) with and without auth"
+    logger.info("p0 osemeeting media downloaded: %d bytes", written)
+    return media_path, ""
+
+
+# ---- audio -> timed segments via OpenAI ASR ------------------------------------------------
+
+def _p0_ose_openai_segments(media_path: str, workdir: str) -> Tuple[List[Dict[str, Any]], str]:
+    """([{start, end, text}] in seconds from the start of the recording, error).
+
+    The audio is re-encoded to low-bitrate mono mp3 and cut into chunks (one OpenAI request is
+    capped at 25 MB), each chunk transcribed with per-segment timestamps and shifted back onto
+    the recording's own timeline.
+    """
+    key = _p0_ose_openai_key()
+    if not key:
+        return [], ("no OpenAI API key — set P0_OSEMEETING_OPENAI_API_KEY (or OPENAI_API_KEY "
+                    "in the environment)")
+    base = (_cfg_str("P0_OSEMEETING_OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+            or "https://api.openai.com/v1").rstrip("/")
+    model = _cfg_str("P0_OSEMEETING_OPENAI_ASR_MODEL", "whisper-1").strip() or "whisper-1"
+    chunk_s = max(60, _cfg_int("P0_OSEMEETING_ASR_CHUNK_SECONDS", 600))
+    bitrate = _cfg_str("P0_OSEMEETING_ASR_BITRATE", "32k").strip() or "32k"
+    timeout = max(30.0, _cfg_float("P0_OSEMEETING_ASR_TIMEOUT_SECONDS", 300.0))
+    lang = _cfg_str("P0_OSEMEETING_ASR_LANG", "").strip()
+    prompt = _cfg_str("P0_OSEMEETING_ASR_PROMPT", "").strip()
+
+    adir = os.path.join(workdir, "asr")
+    os.makedirs(adir, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            [_p0_ffmpeg_bin(), "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000",
+             "-b:a", bitrate, "-f", "segment", "-segment_time", str(chunk_s),
+             "-reset_timestamps", "1", os.path.join(adir, "chunk_%04d.mp3")],
+            capture_output=True, timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        return [], "ffmpeg timed out splitting the audio"
+    chunks = sorted(f for f in os.listdir(adir) if f.startswith("chunk_") and f.endswith(".mp3"))
+    if not chunks:
+        tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        return [], f"ffmpeg produced no audio chunks (rc={proc.returncode}): {tail}"
+
+    segments: List[Dict[str, Any]] = []
+    t0 = time.time()
+    for i, name in enumerate(chunks):
+        path = os.path.join(adir, name)
+        offset = float(i * chunk_s)
+        j: Dict[str, Any] = {}
+        last_err = ""
+        # verbose_json first (it carries the timestamps); a model that rejects it gets a plain retry.
+        for attempt in (0, 1):
+            data: Dict[str, str] = {"model": model}
+            if attempt == 0:
+                data["response_format"] = "verbose_json"
+                data["timestamp_granularities[]"] = "segment"
+            else:
+                data["response_format"] = "json"
+            if lang:
+                data["language"] = lang
+            if prompt:
+                data["prompt"] = prompt
+            try:
+                with open(path, "rb") as fh:
+                    r = requests.post(
+                        f"{base}/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {key}"},
+                        files={"file": (name, fh, "audio/mpeg")},
+                        data=data,
+                        timeout=timeout,
+                    )
+            except Exception as e:
+                last_err = f"{e.__class__.__name__}: {e}"
+                continue
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                except ValueError:
+                    last_err = "response was not JSON"
+                    continue
+                break
+            last_err = f"HTTP {r.status_code}: {(r.text or '')[:200]}"
+            # 400 usually means "this model does not support verbose_json" — worth the retry.
+            if r.status_code != 400:
+                break
+        if not j:
+            if segments:
+                logger.warning("p0 osemeeting ASR chunk %s failed, keeping earlier text: %s",
+                               name, last_err)
+                continue
+            return [], f"OpenAI ASR failed on the first chunk — {last_err}"
+        segs = j.get("segments")
+        if isinstance(segs, list) and segs:
+            for s in segs:
+                if not isinstance(s, dict):
+                    continue
+                txt = str(s.get("text") or "").strip()
+                if not txt:
+                    continue
+                try:
+                    st = float(s.get("start") or 0.0)
+                    en = float(s.get("end") or st)
+                except (TypeError, ValueError):
+                    st, en = 0.0, 0.0
+                segments.append({"start": offset + st, "end": offset + max(st, en), "text": txt})
+        else:
+            # No timestamps available (the json fallback): one segment spanning the whole chunk.
+            txt = str(j.get("text") or "").strip()
+            if txt:
+                segments.append({"start": offset, "end": offset + chunk_s, "text": txt})
+    if not segments:
+        return [], "OpenAI ASR returned no text"
+    segments.sort(key=lambda s: (s["start"], s["end"]))
+    logger.info("p0 osemeeting OpenAI ASR (%s): %d chunks, %d segments, %.1fs compute",
+                model, len(chunks), len(segments), time.time() - t0)
+    return segments, ""
+
+
+def _p0_ose_speakered(segments: List[Dict[str, Any]], turns: List[Dict[str, Any]],
+                      start_epoch: float) -> str:
+    """Attach speaker names from the SRT turns onto the ASR segments by time overlap.
+
+    Consecutive segments from the same speaker are merged, so one person's paragraph stays one
+    line — which reads far better in the minutes than one line per breath.
+    """
+    lines: List[str] = []
+    state = {"spk": "", "txt": "", "start": 0.0}
+
+    def _flush() -> None:
+        if state["txt"].strip():
+            who = state["spk"] or "Speaker"
+            lines.append(f"[{_p0_ose_hhmmss(state['start'], start_epoch)}] {who}: "
+                         f"{state['txt'].strip()}")
+
+    for s in segments:
+        st, en = float(s["start"]), float(s["end"])
+        best, best_ov = "", 0.0
+        for t in turns:
+            ov = min(en, float(t["end"])) - max(st, float(t["start"]))
+            if ov > best_ov:
+                best_ov, best = ov, str(t.get("speaker") or "")
+        if best in ("", "?"):
+            best = state["spk"]  # unattributable sliver — keep it with whoever was talking
+        if best == state["spk"] and state["txt"]:
+            sep = "" if state["txt"].endswith(("。", "，", "、", "…", " ")) else " "
+            state["txt"] = f"{state['txt']}{sep}{s['text']}"
+        else:
+            _flush()
+            state["spk"], state["txt"], state["start"] = best, s["text"], st
+    _flush()
+    return "\n".join(lines)
+# ---- video -> the frames worth keeping, via qwen2.5vl ---------------------------------------
+
+def _p0_ose_sample_frames(media_path: str, workdir: str,
+                          duration: float) -> Tuple[List[Dict[str, Any]], str]:
+    """([{path, t}] distinct sampled frames, error).
+
+    One ffmpeg pass writes both the JPEGs and a 16x16 grey thumbnail stream of the very same
+    frames; the thumbnails are compared in numpy so a screen share that sits still for five
+    minutes costs the vision model one look instead of fifteen. Frame *i* of the ``fps=1/N``
+    stream is at t = i*N, which is where each kept frame's timestamp comes from.
+    """
+    interval = max(2, _cfg_int("P0_OSEMEETING_FRAME_INTERVAL_SECONDS", 20))
+    width = max(320, _cfg_int("P0_OSEMEETING_FRAME_WIDTH", 1280))
+    thresh = max(0.0, _cfg_float("P0_OSEMEETING_FRAME_DEDUPE_THRESHOLD", 3.0))
+    cap = max(1, _cfg_int("P0_OSEMEETING_MAX_FRAMES", 120))
+
+    fdir = os.path.join(workdir, "frames")
+    os.makedirs(fdir, exist_ok=True)
+    raw_path = os.path.join(fdir, "hash.raw")
+    try:
+        proc = subprocess.run(
+            [_p0_ffmpeg_bin(), "-y", "-i", media_path,
+             "-vf", f"fps=1/{interval},scale={width}:-2", "-q:v", "4",
+             os.path.join(fdir, "f_%05d.jpg"),
+             "-vf", f"fps=1/{interval},scale=16:16,format=gray",
+             "-f", "rawvideo", raw_path],
+            capture_output=True, timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        return [], "ffmpeg timed out extracting frames"
+    jpgs = sorted(f for f in os.listdir(fdir) if f.startswith("f_") and f.endswith(".jpg"))
+    if not jpgs:
+        tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
+        return [], f"no frames extracted (rc={proc.returncode}) — audio-only recording? {tail}"
+
+    # Dedupe on the grey thumbnails when we got them; otherwise keep every sampled frame.
+    keep_idx: List[int] = []
+    try:
+        import numpy as np  # deferred: only needed when the vision pass runs
+
+        buf = np.frombuffer(open(raw_path, "rb").read(), dtype=np.uint8)
+        thumbs = buf[: (len(buf) // 256) * 256].reshape(-1, 256).astype(np.int16)
+        last = None
+        for i in range(min(len(thumbs), len(jpgs))):
+            if last is None or float(np.abs(thumbs[i] - last).mean()) >= thresh:
+                keep_idx.append(i)
+                last = thumbs[i]
+    except Exception as e:
+        logger.info("p0 osemeeting frame dedupe unavailable (%s) — keeping every sample",
+                    e.__class__.__name__)
+        keep_idx = list(range(len(jpgs)))
+
+    frames = [{"path": os.path.join(fdir, jpgs[i]), "t": float(i * interval)} for i in keep_idx]
+    if duration > 0:
+        frames = [f for f in frames if f["t"] <= duration + interval]
+    dropped = len(jpgs) - len(frames)
+    if len(frames) > cap:
+        # Thin evenly rather than truncating, so the late half of the meeting is still represented.
+        step = len(frames) / float(cap)
+        frames = [frames[int(i * step)] for i in range(cap)]
+        logger.info("p0 osemeeting frames thinned to the P0_OSEMEETING_MAX_FRAMES cap of %d", cap)
+    logger.info("p0 osemeeting frames: %d sampled every %ds, %d near-duplicates dropped, "
+                "%d going to %s", len(jpgs), interval, dropped, len(frames),
+                _cfg_str("P0_OSEMEETING_VISION_MODEL", "qwen2.5vl:3b"))
+    return frames, ""
+
+
+def _p0_ose_vision_pick(frames: List[Dict[str, Any]],
+                        start_epoch: float) -> List[Dict[str, Any]]:
+    """Ask the vision model which sampled frames carry information; return the keepers captioned."""
+    import base64
+
+    url = _p0_qa_ollama_url()
+    model = _cfg_str("P0_OSEMEETING_VISION_MODEL", "qwen2.5vl:3b").strip() or "qwen2.5vl:3b"
+    timeout = max(15.0, _cfg_float("P0_OSEMEETING_VISION_TIMEOUT_SECONDS", 120.0))
+    max_imgs = max(0, _cfg_int("P0_OSEMEETING_MAX_IMAGES", 8))
+    prompt = _cfg_str("P0_OSEMEETING_VISION_PROMPT", "").strip() or (
+        "This is one frame from the recording of an operations (OSE) team meeting.\n"
+        "Decide whether the frame is worth keeping as evidence in the written meeting minutes.\n"
+        "KEEP it when the frame shows information someone reading the minutes would want to see: "
+        "a shared screen, a dashboard or graph, a monitoring/alert page, a log or terminal output, "
+        "an error message, a configuration or admin page, a spreadsheet, a ticket, a document, a "
+        "diagram, or a slide.\n"
+        "DO NOT keep it when the frame is only people on camera, avatars or initials, a waiting/"
+        "lobby screen, a blank or nearly blank screen, or a duplicate-looking idle desktop.\n"
+        "Reply with ONLY JSON: {\"keep\": true|false, \"caption\": \"<one short factual line "
+        "naming what is on screen, in English>\"}. When keep is false the caption may be empty. "
+        "Never guess at text you cannot actually read in the image."
+    )
+    kept: List[Dict[str, Any]] = []
+    t0 = time.time()
+    looked = 0
+    for fr in frames:
+        if max_imgs and len(kept) >= max_imgs:
+            logger.info("p0 osemeeting vision: hit the %d-image cap, stopping early", max_imgs)
+            break
+        try:
+            with open(fr["path"], "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode("ascii")
+        except OSError:
+            continue
+        body: Dict[str, Any] = {
+            "model": model,
+            "stream": False,
+            "format": "json",
+            "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+            "options": {"temperature": 0},
+        }
+        try:
+            r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+            r.raise_for_status()
+            raw = _monitoring_ai_extract_ollama_text(r.json())
+            looked += 1
+        except Exception as e:
+            logger.info("p0 osemeeting vision call failed at t=%ss: %s: %s",
+                        int(fr["t"]), e.__class__.__name__, e)
+            continue
+        try:
+            parsed = json.loads(raw or "{}")
+        except ValueError:
+            logger.info("p0 osemeeting vision output not JSON at t=%ss: %r",
+                        int(fr["t"]), (raw or "")[:160])
+            continue
+        if not isinstance(parsed, dict) or not parsed.get("keep"):
+            continue
+        cap_txt = str(parsed.get("caption") or "").strip()[:300]
+        kept.append({"path": fr["path"], "t": fr["t"],
+                     "clock": _p0_ose_hhmmss(fr["t"], start_epoch),
+                     "caption": cap_txt or "Screen shared during the meeting"})
+    logger.info("p0 osemeeting vision (%s): looked at %d frames, kept %d, %.1fs",
+                model, looked, len(kept), time.time() - t0)
+    return kept
+
+
+# ---- transcript + frames -> the minutes, via the writer model -------------------------------
+
+def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict[str, str],
+                       topic_slots: int) -> Tuple[Dict[str, Any], str]:
+    """(structured minutes, error). One call: bilingual topics + the Overview values."""
+    url = _p0_qa_ollama_url()
+    model = _p0_ose_writer_model()
+    timeout = max(30.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
+                                   max(900.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 600.0))))
+    num_ctx = max(4096, _cfg_int("P0_QA_NUM_CTX", 16384))
+    max_topics = max(1, _cfg_int("P0_OSEMEETING_MAX_TOPICS", 10))
+    cap = max(4000, _cfg_int("P0_OSEMEETING_TRANSCRIPT_CHARS", 24000))
+    tr = transcript or ""
+    if len(tr) > cap:
+        head = int(cap * 0.7)
+        tr = tr[:head] + "\n…(中间省略/omitted)…\n" + tr[-(cap - head):]
+    shots = "\n".join(f"[{i}] {f['clock']} — {f['caption']}" for i, f in enumerate(frames)) or "-"
+    meta_lines = "\n".join(f"- {k}: {v}" for k, v in meta.items() if v) or "-"
+    style = _cfg_str("P0_OSEMEETING_PROMPT", "").strip() or (
+        "You write the minutes of an OSE (operations) team meeting into a bilingual template.\n"
+        "INPUT 1 is metadata. INPUT 2 is the timed, speaker-labelled transcript (mixed Chinese and "
+        "English, with speech-recognition errors — read through them, do not copy them). INPUT 3 "
+        "lists screenshots already captured from the recording, each with an index and a caption.\n"
+        "Output ONLY JSON of this shape:\n"
+        "{\"overview\": {\"date\": \"YYYY/MM/DD\", \"participants\": \"<names, comma separated>\"},\n"
+        " \"topics\": [{\"en_title\": \"<short topic title>\",\n"
+        "              \"en_bullets\": [\"<what was said/decided>\", ...],\n"
+        "              \"zh_title\": \"<same title in 中文>\",\n"
+        "              \"zh_bullets\": [\"<same content in 中文>\", ...],\n"
+        "              \"frames\": [<INPUT 3 indexes that belong to this topic>]}]}\n"
+        "Rules:\n"
+        f"1) Write between 1 and {max_topics} topics, ordered as the meeting covered them. Group the "
+        "discussion by SUBJECT, not by speaker — one topic per thing the team actually talked about.\n"
+        "2) en_bullets and zh_bullets must be the SAME content in the two languages, bullet for "
+        "bullet and in the same order. Each list holds 1-6 bullets. A bullet is one complete, "
+        "self-contained sentence a reader who missed the meeting can act on.\n"
+        "3) Record what matters: the problem or topic raised, who raised it, findings, numbers and "
+        "dates that were stated, decisions taken, action items with their owner, and anything left "
+        "open. Name people when the transcript names them.\n"
+        "4) Never invent anything. No names, numbers, dates, links or owners that are not in the "
+        "inputs. If the meeting left something undecided, write that it is still open.\n"
+        "5) Leave out pure filler — greetings, OK/嗯/好的, small talk, repeats, sound checks.\n"
+        "6) Titles are short noun phrases (2-8 words), no numbering and no trailing punctuation — "
+        "the numbering is added by the system.\n"
+        "7) \"frames\": only the indexes whose caption clearly relates to that topic; the same index "
+        "must not appear under two topics, and an index that fits nothing is simply left out.\n"
+        "8) overview.date: the meeting date from the metadata, formatted YYYY/MM/DD. "
+        "overview.participants: the speakers actually heard in the transcript, comma separated; "
+        "leave it \"\" when the transcript carries no names.\n"
+        "9) Chinese text uses 汉字; keep technical terms, product names and commands in English "
+        "inside the Chinese bullets too (e.g. 「重启 gateway 服务」)."
+    )
+    user = (f"INPUT 1 — METADATA:\n{meta_lines}\n\n"
+            f"INPUT 3 — SCREENSHOTS AVAILABLE:\n{shots}\n\n"
+            f"INPUT 2 — TRANSCRIPT:\n{tr}")
+    body: Dict[str, Any] = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [{"role": "system", "content": style}, {"role": "user", "content": user}],
+        "options": {"temperature": 0.2, "num_ctx": num_ctx},
+        "think": False,
+    }
+    try:
+        r = requests.post(f"{url}/api/chat", json=body, timeout=timeout)
+        r.raise_for_status()
+        raw = _monitoring_ai_extract_ollama_text(r.json())
+    except Exception:
+        logger.exception("p0 osemeeting writer call failed")
+        return {}, "模型调用失败/超时 / writer model call failed or timed out — check the journal"
+    try:
+        parsed = json.loads(raw or "{}")
+    except ValueError:
+        logger.warning("p0 osemeeting writer output not JSON: %r", (raw or "")[:400])
+        return {}, "模型输出不是有效 JSON / writer output was not valid JSON — see journal"
+    if not isinstance(parsed, dict):
+        return {}, "模型输出不是对象 / writer output was not a JSON object"
+
+    used: Set[int] = set()
+    topics: List[Dict[str, Any]] = []
+    for t in (parsed.get("topics") or [])[:max_topics]:
+        if not isinstance(t, dict):
+            continue
+        en_b = [str(b).strip() for b in (t.get("en_bullets") or []) if str(b or "").strip()][:6]
+        zh_b = [str(b).strip() for b in (t.get("zh_bullets") or []) if str(b or "").strip()][:6]
+        en_t = str(t.get("en_title") or "").strip()
+        zh_t = str(t.get("zh_title") or "").strip()
+        if not (en_t or zh_t) or not (en_b or zh_b):
+            continue
+        idx: List[int] = []
+        for n in (t.get("frames") or [])[:6]:
+            try:
+                k = int(n)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= k < len(frames) and k not in used:
+                used.add(k)
+                idx.append(k)
+        topics.append({
+            "en_title": en_t or zh_t, "zh_title": zh_t or en_t,
+            "en_bullets": en_b or zh_b, "zh_bullets": zh_b or en_b, "frames": idx,
+        })
+    if not topics:
+        return {}, "模型没有写出任何议题 / the writer produced no topics — see journal"
+    ov = parsed.get("overview") if isinstance(parsed.get("overview"), dict) else {}
+    out = {
+        "overview": {"date": str((ov or {}).get("date") or "").strip(),
+                     "participants": str((ov or {}).get("participants") or "").strip()},
+        "topics": topics,
+        "unplaced_frames": [i for i in range(len(frames)) if i not in used],
+    }
+    logger.info("p0 osemeeting writer (%s): %d topics, %d/%d screenshots placed; raw head=%r",
+                model, len(topics), len(used), len(frames), (raw or "")[:300])
+    if topic_slots and len(topics) > topic_slots:
+        logger.info("p0 osemeeting: %d topics vs %d template slots — the extras get new headings",
+                    len(topics), topic_slots)
+    return out, ""
+# ---- writing into the docx ------------------------------------------------------------------
+
+def _p0_docx_create_children(document_id: str, parent_id: str, index: int,
+                             children: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
+    """(ids of the created blocks, error). ``index`` is the position in the parent's child list."""
+    if not children:
+        return [], {}
+    body = {"index": max(0, index), "children": children}
+    last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.post(
+                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks/{parent_id}/children",
+                headers={"Authorization": f"Bearer {tok}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                params={"document_revision_id": -1},
+                json=body,
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            made = (j.get("data") or {}).get("children") or []
+            return [str(b.get("block_id") or "") for b in made if isinstance(b, dict)], {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg"), "http": r.status_code}
+        logger.info("p0 osemeeting create children under %s via %s token failed http=%s body=%r",
+                    parent_id, kind, r.status_code, (r.text or "")[:200])
+    return [], last_err
+
+
+def _p0_ose_text_block(kind: str, text: str) -> Dict[str, Any]:
+    """A new-block payload for the text-bearing block types this command writes."""
+    types = {"heading3": 5, "heading4": 6, "text": 2, "bullet": 12}
+    return {"block_type": types.get(kind, 2),
+            kind: {"elements": [{"text_run": {"content": text}}]}}
+
+
+def _p0_docx_insert_image(document_id: str, parent_id: str, index: int,
+                          jpg_path: str) -> Tuple[bool, Dict[str, Any]]:
+    """Put one local image into the doc: empty image block -> upload the bytes -> point the block
+    at the uploaded file. Needs the drive:drive scope on top of docx:document."""
+    ids, err = _p0_docx_create_children(document_id, parent_id, index,
+                                        [{"block_type": 27, "image": {"token": ""}}])
+    if not ids or not ids[0]:
+        return False, err or {"code": "NO_BLOCK", "msg": "image block not created"}
+    img_block = ids[0]
+    try:
+        size = os.path.getsize(jpg_path)
+        blob = open(jpg_path, "rb").read()
+    except OSError as e:
+        return False, {"code": -1, "msg": f"cannot read {jpg_path}: {e.__class__.__name__}"}
+    name = os.path.basename(jpg_path)
+    file_token, last_err = "", {"code": "NO_TOKEN", "msg": "no usable token"}
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.post(
+                f"{_lark_api_domain()}/open-apis/drive/v1/medias/upload_all",
+                headers={"Authorization": f"Bearer {tok}"},
+                files={"file": (name, blob, "image/jpeg")},
+                data={"file_name": name, "parent_type": "docx_image",
+                      "parent_node": img_block, "size": str(size)},
+                timeout=180,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            file_token = str(((j.get("data") or {}).get("file_token")) or "")
+            if file_token:
+                break
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg"), "http": r.status_code}
+        logger.info("p0 osemeeting media upload via %s token failed http=%s body=%r",
+                    kind, r.status_code, (r.text or "")[:200])
+    if not file_token:
+        return False, last_err
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.patch(
+                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks/{img_block}",
+                headers={"Authorization": f"Bearer {tok}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                params={"document_revision_id": -1},
+                json={"replace_image": {"token": file_token}},
+                timeout=30,
+            )
+            j = r.json()
+        except Exception as e:
+            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+            continue
+        if int(j.get("code", -1)) == 0:
+            return True, {}
+        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
+    return False, last_err
+
+
+def _p0_ose_norm_label(text: str) -> str:
+    return re.sub(r"[\s:：*]+", " ", (text or "")).strip().lower()
+
+
+def _p0_ose_doc_layout(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Map the minutes template: the page block, the two language sections and their topic slots.
+
+    Only TOP-LEVEL blocks decide section boundaries, because a heading's bullets are nested
+    inside it — so the insertion point for a brand-new topic is an index into the page's own
+    child list, never into the flat block list.
+    """
+    page = items[0] if items else {}
+    page_id = str(page.get("block_id") or "")
+    kids = [str(k) for k in (page.get("children") or [])]
+    by_id = {str(b.get("block_id") or ""): b for b in items}
+    sections: Dict[str, Dict[str, Any]] = {
+        "en": {"slots": [], "insert_index": len(kids), "found": False},
+        "zh": {"slots": [], "insert_index": len(kids), "found": False},
+    }
+    cur = ""
+    for pos, bid in enumerate(kids):
+        b = by_id.get(bid) or {}
+        _kind, txt = _p0_docx_block_text(b)
+        t = (txt or "").strip()
+        if t and _P0_OSE_ZH_SECTION_RE.search(t):
+            cur = "zh"
+            sections["zh"].update({"found": True, "insert_index": pos + 1})
+            continue
+        if t and _P0_OSE_EN_SECTION_RE.search(t):
+            cur = "en"
+            sections["en"].update({"found": True, "insert_index": pos + 1})
+            continue
+        if not cur:
+            continue
+        # heading3/heading4 that is (or should be) a numbered topic slot
+        if b.get("block_type") in (5, 6) and (not t or _P0_OSE_NUMBERED_RE.match(t)):
+            sections[cur]["slots"].append(bid)
+        # Trailing dividers and blank paragraphs are section furniture, not content — an appended
+        # topic belongs above them, not below the horizontal rule that closes the section.
+        if t or b.get("block_type") not in (2, 22):
+            sections[cur]["insert_index"] = pos + 1
+    # A doc with no language headings at all: treat the whole thing as the English section.
+    if not sections["en"]["found"] and not sections["zh"]["found"]:
+        slots: List[str] = []
+        for bid in kids:
+            b = by_id.get(bid) or {}
+            if b.get("block_type") not in (5, 6):
+                continue
+            t = (_p0_docx_block_text(b)[1] or "").strip()
+            if not t or _P0_OSE_NUMBERED_RE.match(t):
+                slots.append(bid)
+        sections["en"].update({"found": True, "slots": slots, "insert_index": len(kids)})
+    return {"page_id": page_id, "page_children": kids, "by_id": by_id, "sections": sections}
+
+
+def _p0_ose_fill_overview(document_id: str, items: List[Dict[str, Any]],
+                          values: Dict[str, str]) -> Tuple[int, int]:
+    """Patch the Overview table: each label cell's value is the next text block after it."""
+    label_of: Dict[int, str] = {}
+    texts: List[Tuple[int, str, str]] = []  # (position, block_id, text)
+    for i, b in enumerate(items):
+        kind, txt = _p0_docx_block_text(b)
+        if not kind or kind == "page":
+            continue
+        texts.append((i, str(b.get("block_id") or ""), (txt or "").strip()))
+    all_labels = {lbl for _key, lbls in _P0_OSE_OVERVIEW_LABELS for lbl in lbls}
+    for n, (_i, _bid, txt) in enumerate(texts):
+        norm = _p0_ose_norm_label(txt)
+        for key, labels in _P0_OSE_OVERVIEW_LABELS:
+            if norm in labels:
+                label_of[n] = key
+                break
+    ok = bad = 0
+    for n, key in label_of.items():
+        want = (values.get(key) or "").strip()
+        if not want or n + 1 >= len(texts):
+            continue
+        _ni, nbid, ntxt = texts[n + 1]
+        if _p0_ose_norm_label(ntxt) in all_labels:
+            continue  # the next block is another label — this label has no value cell
+        if ntxt == want:
+            continue
+        good, err = _p0_docx_patch_block(document_id, nbid, want)
+        if good:
+            ok += 1
+        else:
+            bad += 1
+            logger.info("p0 osemeeting overview %s -> %r failed: %s", key, want[:40], err)
+    return ok, bad
+
+
+def _p0_ose_write_section(document_id: str, layout: Dict[str, Any], lang: str,
+                          topics: List[Dict[str, Any]], frames: List[Dict[str, Any]],
+                          with_images: bool) -> Dict[str, int]:
+    """Write one language section. Existing numbered slots are filled first, extra topics get
+    fresh headings appended at the end of that section."""
+    sec = layout["sections"][lang]
+    by_id = layout["by_id"]
+    tkey, bkey = (f"{lang}_title", f"{lang}_bullets")
+    stat = {"headings": 0, "bullets": 0, "images": 0, "failed": 0}
+    slots = list(sec["slots"])
+    insert_at = int(sec["insert_index"])
+    for n, topic in enumerate(topics):
+        emoji = _P0_OSE_NUM_EMOJI[n] if n < len(_P0_OSE_NUM_EMOJI) else f"{n + 1}."
+        title = f"{emoji} {str(topic.get(tkey) or '').strip()}".strip()
+        bullets = [str(b).strip() for b in (topic.get(bkey) or []) if str(b or "").strip()]
+        if n < len(slots):
+            head_id = slots[n]
+            good, err = _p0_docx_patch_block(document_id, head_id, title)
+            if good:
+                stat["headings"] += 1
+            else:
+                stat["failed"] += 1
+                logger.info("p0 osemeeting %s heading %d patch failed: %s", lang, n + 1, err)
+            existing = [str(k) for k in ((by_id.get(head_id) or {}).get("children") or [])]
+        else:
+            made, err = _p0_docx_create_children(
+                document_id, layout["page_id"], insert_at,
+                [_p0_ose_text_block("heading3", title)])
+            if not made:
+                stat["failed"] += 1
+                logger.info("p0 osemeeting %s extra heading %d create failed: %s", lang, n + 1, err)
+                continue
+            head_id, existing = made[0], []
+            insert_at += 1
+            stat["headings"] += 1
+        # Fill the bullet slots that already exist, then append whatever is left over.
+        for i, text in enumerate(bullets):
+            if i < len(existing):
+                good, err = _p0_docx_patch_block(document_id, existing[i], text)
+                if good:
+                    stat["bullets"] += 1
+                else:
+                    stat["failed"] += 1
+                    logger.info("p0 osemeeting %s bullet patch failed: %s", lang, err)
+        leftover = bullets[len(existing):]
+        if leftover:
+            made, err = _p0_docx_create_children(
+                document_id, head_id, len(existing),
+                [_p0_ose_text_block("bullet", t) for t in leftover])
+            if made:
+                stat["bullets"] += len(made)
+            else:
+                stat["failed"] += len(leftover)
+                logger.info("p0 osemeeting %s bullet create failed: %s", lang, err)
+        if with_images:
+            at = max(len(existing), len(bullets))
+            for k in topic.get("frames") or []:
+                if not (0 <= k < len(frames)):
+                    continue
+                fr = frames[k]
+                cap_line = f"🖼️ {fr['clock']} — {fr['caption']}"
+                made, _err = _p0_docx_create_children(
+                    document_id, head_id, at, [_p0_ose_text_block("text", cap_line)])
+                at += 1 if made else 0
+                good, ierr = _p0_docx_insert_image(document_id, head_id, at, fr["path"])
+                if good:
+                    stat["images"] += 1
+                    at += 1
+                else:
+                    stat["failed"] += 1
+                    logger.info("p0 osemeeting image insert failed at %s: %s", fr["clock"], ierr)
+    return stat
+
+
+def _p0_ose_retitle(document_id: str, items: List[Dict[str, Any]], date_str: str) -> bool:
+    """Stamp the meeting date onto the doc title and drop template words from it."""
+    if not items or not date_str:
+        return False
+    page = items[0]
+    kind, txt = _p0_docx_block_text(page)
+    if kind != "page":
+        return False
+    base = re.sub(r"^\s*[\[\(【]\s*[\d/.\-年月日\s]{6,20}\s*[\]\)】]\s*", "", (txt or "").strip())
+    base = _p0_strip_template_tail(base, True).strip() or "Meeting Minutes"
+    want = f"[{date_str}] {base}"
+    if want == (txt or "").strip():
+        return False
+    good, err = _p0_docx_patch_block(document_id, str(page.get("block_id") or ""), want)
+    if not good:
+        logger.info("p0 osemeeting title patch failed: %s", err)
+    return good
+# ---- the worker ------------------------------------------------------------------------------
+
+def _p0_ose_transcript(minute_token: str, workdir: str,
+                       start_epoch: float) -> Tuple[str, str, str, float]:
+    """(transcript, source label, media path, duration).
+
+    OpenAI ASR first (audio heard fresh, speaker names borrowed from the Minutes SRT), then the
+    local engine, then Lark's own text. The media is downloaded once and handed back so the
+    vision pass can reuse it instead of pulling the recording twice.
+    """
+    provider = (_cfg_str("P0_OSEMEETING_ASR_PROVIDER", "openai").strip().lower() or "openai")
+    media_path, duration = "", 0.0
+    if provider == "openai" and _p0_ose_openai_key():
+        media_path, derr = _p0_ose_download_media(minute_token, workdir)
+        if not media_path:
+            logger.warning("p0 osemeeting recording download failed: %s", derr)
+        else:
+            duration = _p0_ose_media_duration(media_path)
+            segments, aerr = _p0_ose_openai_segments(media_path, workdir)
+            if segments:
+                turns: List[Dict[str, Any]] = []
+                srt_raw, serr = _p0_minutes_export(
+                    minute_token,
+                    {"need_speaker": "true", "need_timestamp": "true", "file_format": "srt"}, "srt")
+                if srt_raw:
+                    turns = _p0_srt_turns(srt_raw.decode("utf-8", "replace"))
+                else:
+                    logger.info("p0 osemeeting SRT export unavailable (%s) — no speaker names",
+                                serr.get("msg"))
+                named = [t for t in turns if (t.get("speaker") or "?") != "?"]
+                if named:
+                    return (_p0_ose_speakered(segments, turns, start_epoch),
+                            f"OpenAI ASR + Minutes speaker names "
+                            f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
+                            media_path, duration)
+                # No speaker labels to borrow — still far better than nothing, just unattributed.
+                lines = [f"[{_p0_ose_hhmmss(s['start'], start_epoch)}] {s['text']}"
+                         for s in segments]
+                return ("\n".join(lines),
+                        f"OpenAI ASR, no speaker labels "
+                        f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
+                        media_path, duration)
+            logger.warning("p0 osemeeting OpenAI ASR failed — falling back: %s", aerr)
+    elif provider == "openai":
+        logger.info("p0 osemeeting: no OpenAI key configured — falling back to the local/Lark path")
+
+    if provider in ("openai", "local") and _p0_whotalk_asr_enabled():
+        text, aerr = _p0_whotalk_local_transcribe(minute_token, with_times=True,
+                                                  start_epoch=start_epoch)
+        if text:
+            return text, f"本地识别 local ASR ({_p0_whotalk_asr_engine()})", media_path, duration
+        logger.warning("p0 osemeeting local ASR failed: %s", aerr)
+    text = _p0_srt_timed_transcript(minute_token, start_epoch)
+    if text:
+        return text, "Lark ASR (timed)", media_path, duration
+    text, terr = _p0_minutes_transcript(minute_token)
+    if text:
+        return text, "Lark ASR", media_path, duration
+    logger.info("p0 osemeeting: no transcript at all: %s", terr)
+    return "", "", media_path, duration
+
+
+def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key: str) -> None:
+    rt, rv = (
+        ("chat_id", chat_id)
+        if (chat_id or "").strip()
+        else (("open_id", open_id) if (open_id or "").strip() else ("", ""))
+    )
+    react = _lark_env_truthy_or_default("P0_REACT_ENABLE", default=True) and bool((mid or "").strip())
+    ack_id = _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_ACK_EMOJI", "OK").strip() or "OK") if react else None
+    workdir = ""
+
+    def _card(title: str, template: str, lines: List[str]) -> None:
+        if rt and rv:
+            _p0_meeting_send_card(rt, rv, "", template, title, lines)
+
+    def _say(text: str) -> None:
+        if rt and rv:
+            _lark_send_text_auto(rt, rv, text)
+
+    try:
+        a = (arg or "").strip()
+        # Either order: the doc is the /wiki/ or /docx/ link, the rest is the meeting reference.
+        mdoc = re.search(r"https?://\S*/(?:wiki|docx)/[A-Za-z0-9]+\S*", a)
+        if not mdoc:
+            _card("⚠️ /osemeeting 用法 / usage", "red",
+                  [f"`{_p0_ose_trigger()}`", "`<会议链接|9位会议号|妙记链接>`", "`<文档链接 /wiki/ 或 /docx/>`",
+                   "两行顺序可以互换 / the two links may be given in either order",
+                   "会议部分留空 = 最近一次机器人录制的会议 / empty meeting part = last bot-recorded meeting"])
+            return
+        doc_link = mdoc.group(0)
+        meeting_arg = (a[:mdoc.start()] + " " + a[mdoc.end():]).strip()
+
+        document_id, derr = _p0_doc_link_to_document_id(doc_link)
+        if not document_id:
+            _card("⚠️ 文档无法访问 / doc not accessible", "red", [derr])
+            return
+        token, err = _p0_whotalk_resolve_minute_token(meeting_arg)
+        if not token:
+            _card("⚠️ 会议无法解析 / meeting not resolved", "red", [err])
+            return
+        items, berr = _p0_docx_blocks_raw(document_id)
+        if not items:
+            _card("⚠️ 读取文档失败 / could not read doc", "red",
+                  [f"`code={berr.get('code')}  msg={berr.get('msg')}`",
+                   "应用需 docx 编辑权限且文档已共享给应用 / grant docx edit + share the doc with the app"])
+            return
+        layout = _p0_ose_doc_layout(items)
+        slots_en = len(layout["sections"]["en"]["slots"])
+        slots_zh = len(layout["sections"]["zh"]["slots"])
+
+        meta = dict(_p0_minutes_meta(token))
+        host_m = re.search(r"https?://([^/]+)/", doc_link)
+        if host_m and not meta.get("meeting minutes/recording link"):
+            meta["meeting minutes/recording link"] = f"https://{host_m.group(1)}/minutes/{token}"
+        meta.setdefault("meeting date", time.strftime("%Y/%m/%d"))
+        start_epoch = 0.0
+        try:
+            if meta.get("meeting start time"):
+                start_epoch = time.mktime(time.strptime(meta["meeting start time"], "%Y/%m/%d %H:%M"))
+        except (ValueError, OverflowError):
+            pass
+        if start_epoch:
+            _shift, duty = _p0_duty_on(start_epoch)
+            if duty:
+                meta["OSE on-duty roster"] = f"{', '.join(duty)}（{_shift} 班 / {_shift} shift）"
+
+        workdir = tempfile.mkdtemp(prefix="p0ose_")
+        _say(f"🎬 开始整理会议记录 / writing the minutes…\n"
+             f"文档 doc: `{document_id}` · 妙记 minutes: `{token}`\n"
+             f"模板槽位 template slots: EN {slots_en} · 中文 {slots_zh}")
+
+        transcript, src, media_path, duration = _p0_ose_transcript(token, workdir, start_epoch)
+        if not transcript:
+            _card("⚠️ 无法取得转写 / transcript unavailable", "red",
+                  ["音频识别与 Lark 转写都失败了 / both ASR and the Lark transcript failed",
+                   "参考 /whotalk 的权限要求 / see the /whotalk permission requirements"])
+            return
+        teams = _p0_transcript_speaker_teams(transcript)
+        if teams:
+            meta["speakers and their teams (from contact directory)"] = "; ".join(teams)
+
+        frames: List[Dict[str, Any]] = []
+        vision_note = "关闭 off"
+        if _lark_env_truthy_or_default("P0_OSEMEETING_VISION_ENABLE", default=True):
+            if not media_path:
+                media_path, mderr = _p0_ose_download_media(token, workdir)
+                if not media_path:
+                    vision_note = f"录像下载失败 recording download failed ({mderr[:80]})"
+            if media_path:
+                if duration <= 0:
+                    duration = _p0_ose_media_duration(media_path)
+                sampled, ferr = _p0_ose_sample_frames(media_path, workdir, duration)
+                if sampled:
+                    frames = _p0_ose_vision_pick(sampled, start_epoch)
+                    vision_note = (f"{_cfg_str('P0_OSEMEETING_VISION_MODEL', 'qwen2.5vl:3b')} "
+                                   f"看了 {len(sampled)} 帧，留下 {len(frames)} 张 / "
+                                   f"reviewed {len(sampled)} frames, kept {len(frames)}")
+                else:
+                    vision_note = f"无法抽帧 no frames ({ferr[:80]})"
+
+        _say(f"📝 转写完成 / transcript ready — {len(transcript)} 字符 chars，来源 source: {src}\n"
+             f"🖼️ 画面 vision: {vision_note}\n"
+             f"✍️ {_p0_ose_writer_model()} 正在撰写双语议题 / writing the bilingual topics…")
+
+        minutes, uerr = _p0_ose_ai_minutes(transcript, frames, meta, max(slots_en, slots_zh))
+        if uerr:
+            _card("⚠️ 撰写失败 / writing failed", "red",
+                  [uerr, "journal 里有模型原始输出 / raw model output is in the journal "
+                         "(`p0 osemeeting writer:`)"])
+            return
+        topics = minutes["topics"]
+
+        date_str = (minutes["overview"].get("date") or meta.get("meeting date") or "").strip()
+        participants = (minutes["overview"].get("participants")
+                        or ", ".join(t.split(" (")[0] for t in teams[:12])
+                        or _cfg_str("P0_OSEMEETING_PARTICIPANTS_FALLBACK", "MY OSE").strip())
+        ov_ok, ov_bad = _p0_ose_fill_overview(document_id, items, {
+            "date": date_str,
+            "participants": participants,
+            "prepared_by": _cfg_str("P0_OSEMEETING_PREPARED_BY", "").strip(),
+        })
+        retitled = _p0_ose_retitle(document_id, items, date_str)
+
+        # Images go in the English section only — the same screenshot twice in one doc reads as noise.
+        # The sections are written BACK TO FRONT: a topic appended past the template's slots inserts
+        # a top-level block, which shifts the page-child index of everything after it, so the later
+        # section has to be finished while its recorded insertion point is still valid.
+        blank = {"headings": 0, "bullets": 0, "images": 0, "failed": 0}
+        done: Dict[str, Dict[str, int]] = {"en": dict(blank), "zh": dict(blank)}
+        order = sorted((l for l in ("en", "zh") if layout["sections"][l]["found"]),
+                       key=lambda l: layout["sections"][l]["insert_index"], reverse=True)
+        for lang in order:
+            done[lang] = _p0_ose_write_section(document_id, layout, lang, topics, frames,
+                                               with_images=(lang == "en"))
+        en, zh = done["en"], done["zh"]
+
+        logger.info("p0 osemeeting done doc=%s topics=%d en=%s zh=%s overview=%d/%d images=%d "
+                    "title=%s src=%r", document_id, len(topics), en, zh, ov_ok, ov_bad,
+                    en["images"], retitled, src)
+        lines = [
+            f"**议题 topics**: {len(topics)}",
+            f"**English**: {en['headings']} 标题 headings · {en['bullets']} 条 bullets · "
+            f"{en['images']} 张图 images",
+            (f"**中文**: {zh['headings']} 标题 headings · {zh['bullets']} 条 bullets"
+             if layout["sections"]["zh"]["found"] else "**中文**: 文档里没有中文版区块 / no 中文版 section"),
+            f"**Overview 表**: 填了 {ov_ok} 格 cells" + (f"（{ov_bad} 失败 failed）" if ov_bad else ""),
+            f"**转写 transcript**: {len(transcript)} 字符 chars · {src}",
+            f"**画面 vision**: {vision_note}",
+        ]
+        if minutes.get("unplaced_frames"):
+            lines.append(f"**未归类截图 unplaced screenshots**: {len(minutes['unplaced_frames'])}"
+                         "（模型认为不属于任何议题 / the writer matched them to no topic）")
+        failed = en["failed"] + zh["failed"] + ov_bad
+        if failed:
+            lines.append(f"⚠️ {failed} 处写入失败 / {failed} writes failed — journal 有详情 / see journal")
+        if retitled:
+            lines.append(f"**标题 title**: 已加上日期 / date stamped ({date_str})")
+        lines.append(f"[打开文档 / open the doc]({doc_link})")
+        _card("✅ /osemeeting — 会议记录已写入 / minutes written",
+              "orange" if failed else "green", lines)
+    except Exception:
+        logger.exception("p0 osemeeting worker failed")
+        _card("⚠️ /osemeeting 失败 / failed", "red",
+              ["内部错误，详见 journal / internal error — see the journal"])
+    finally:
+        if workdir:
+            if _lark_env_truthy("P0_OSEMEETING_KEEP_MEDIA"):
+                logger.info("p0 osemeeting work dir kept at %s (P0_OSEMEETING_KEEP_MEDIA=1)", workdir)
+            else:
+                shutil.rmtree(workdir, ignore_errors=True)
+        if react and ack_id:
+            _p0_lark_add_reaction(mid, _cfg_str("P0_REACT_DONE_EMOJI", "DONE").strip() or "DONE")
+            if _lark_env_truthy_or_default("P0_REACT_REMOVE_ACK", default=True):
+                _p0_lark_remove_reaction(mid, ack_id)
+        with _monitoring_reply_dispatch_lock:
+            _monitoring_inflight_keys.discard(debounce_key)
+
+
+def _p0_try_handle_osemeeting(
+    *,
+    chat_id: str,
+    open_id: str,
+    clean: str,
+    mid: str,
+    im_event_id: str,
+    sender_debounce: str,
+    msg_time: str,
+) -> bool:
+    """Handle "/osemeeting <meeting> <doc link>" (either order). Returns True when handled."""
+    if not _p0_ose_enabled():
+        return False
+    body = _p0_command_body((clean or "").strip(), _p0_ose_trigger())
+    if body is None:
+        return False
+    processed_stick = _monitoring_processed_stick(mid, im_event_id, chat_id or "", sender_debounce, msg_time)
+    debounce_key = f"{(chat_id or '').strip()}\n__p0_osemeeting__\n{(body or '')[:80]}"
+    with _monitoring_reply_dispatch_lock:
+        if im_event_id and im_event_id in _processed_lark_im_event_ids:
+            return True
+        if processed_stick and processed_stick in _processed_lark_message_ids:
+            return True
+        if debounce_key in _monitoring_inflight_keys:
+            return True
+        _monitoring_inflight_keys.add(debounce_key)
+        if processed_stick:
+            _processed_lark_message_ids.add(processed_stick)
+        if im_event_id:
+            _processed_lark_im_event_ids.add(im_event_id)
+            if len(_processed_lark_im_event_ids) > _PROCESSED_IM_EVENT_IDS_CAP:
+                _processed_lark_im_event_ids.clear()
+                _processed_lark_im_event_ids.add(im_event_id)
+    logger.info("p0 osemeeting accepted arg=%r chat=%s", (body or "")[:80], bool(chat_id))
+    try:
+        threading.Thread(
+            target=_p0_ose_worker,
+            args=(chat_id or "", open_id or "", body or "", mid or "", debounce_key),
+            daemon=True,
+            name="p0-osemeeting",
+        ).start()
+    except Exception:
+        logger.exception("p0 osemeeting worker thread failed to start")
         with _monitoring_reply_dispatch_lock:
             _monitoring_inflight_keys.discard(debounce_key)
     return True
@@ -13992,6 +15167,18 @@ def _process_im_message_event_impl(data: Dict[str, Any]) -> None:
 
     # p0bot: admin OAuth for the meeting report (/vcauth, /vccode) — before /meeting.
     if _p0_try_handle_vcauth(
+        chat_id=chat_id,
+        open_id=open_id or "",
+        clean=clean or "",
+        mid=mid,
+        im_event_id=im_event_id,
+        sender_debounce=sender_debounce,
+        msg_time=msg_time,
+    ):
+        return
+
+    # p0bot: "/osemeeting <meeting> <doc link>" → write the bilingual OSE meeting minutes.
+    if _p0_try_handle_osemeeting(
         chat_id=chat_id,
         open_id=open_id or "",
         clean=clean or "",

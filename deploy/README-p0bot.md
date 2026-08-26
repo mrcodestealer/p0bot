@@ -186,6 +186,55 @@ the app as **editable**. If the bot can't write the doc, it posts the filled con
 for manual pasting instead. Order of the two links doesn't matter; leave the meeting part
 empty to use the last bot-recorded meeting.
 
+## Write the OSE / weekly meeting minutes ("/osemeeting")
+
+```
+/osemeeting
+<meeting link|9-digit no|minutes link>
+<doc link (/wiki/ or /docx/)>
+```
+
+The two links may be given in **either order** (the doc is the one with `/wiki/` or `/docx/` in
+its path); leave the meeting part empty to use the last bot-recorded meeting. Unlike `/p0docs`,
+which fills labelled fields in place, this one **writes the minutes**: it produces the discussion
+topics themselves, in both languages, and embeds screenshots from the recording.
+
+Three models over **one** download of the recording:
+
+| Stage | Model | What it does |
+| --- | --- | --- |
+| audio → text | **OpenAI ASR** (`whisper-1`) | Hears the recording and returns timed segments. Speaker names come from the Minutes SRT export and are matched onto those segments by time overlap, so each line lands as `[HH:MM:SS] Name: text`. |
+| video → pictures | **`qwen2.5vl:3b`** (local Ollama) | Frames are sampled every 20 s and near-duplicates are dropped *before* the model sees them; it then decides which survivors carry information — a shared screen, dashboard, alert page, log, error, config, ticket — and captions each keeper. People-on-camera and idle screens are rejected. |
+| text → minutes | **`qwen3.6:35b-a3b`** (local Ollama) | Turns the transcript + the frame captions into the doc's own layout: the Overview table, then numbered discussion topics written twice — once under `English Version`, once under `中文版` — with each kept screenshot placed under the topic it belongs to. |
+
+`whisper-1` is the default because it is the only OpenAI transcription model that still returns
+per-segment timestamps (`verbose_json`), and those timestamps are what make the speaker matching
+possible. `gpt-4o-transcribe` returns text only; with it a whole chunk is attributed to whoever
+spoke most in it.
+
+What it writes into the doc:
+
+- **Overview table** — `Date` and `Participants` (from the speakers actually heard). `Prepared by`
+  is only touched when `P0_OSEMEETING_PREPARED_BY` is set, so an existing name is never clobbered.
+- **Doc title** — restamped as `[YYYY/MM/DD] <name>`, with any old date and template words
+  (`Template`, `Copy`, `副本`) removed.
+- **Topics** — the template's four `1️⃣`–`4️⃣` slots are filled first; a meeting with more topics
+  gets extra headings appended inside the same section, and unused slots are left untouched.
+- **Screenshots** — a caption line (`🖼️ HH:MM:SS — what it shows`) followed by the image, under the
+  English topic only. The same picture twice in one doc just reads as noise.
+
+Everything degrades instead of failing: no OpenAI key → local ASR → Lark's own text; an audio-only
+recording or no ffmpeg → text-only minutes; a block that won't patch is counted and reported in the
+result card rather than aborting the run.
+
+Setup on top of `/p0docs`: scope **`minutes:minutes.media:export`** (download the recording — add
+it, publish, then re-run `/vcauth`), scope **`drive:drive`** (upload the images), `ffmpeg` on the
+server, `ollama pull qwen2.5vl:3b`, and an OpenAI key in `P0_OSEMEETING_OPENAI_API_KEY` (or
+`OPENAI_API_KEY` in the environment). The doc must be shared to the app as **editable**.
+
+> The audio leaves the server for OpenAI; the video never does — the vision pass is local. Set
+> `P0_OSEMEETING_ASR_PROVIDER=local` to keep the audio on the box too (uses the `/whotalk` engine).
+
 ## Contact directory (`contacts.csv`) — phone numbers p0bot can answer from
 
 `contacts.csv` in the repo root (`name,team,phone`) is folded into **every** answer's context,
@@ -201,6 +250,7 @@ for FPMS?" or "what's Jun Chen's number?" even if those people aren't in the wik
 
 - **Ollama** running on the server with the model pulled: `ollama pull qwen3.6:35b-a3b`.
   The service user must reach `P0_QA_OLLAMA_URL` (default `http://localhost:11434`).
+  `/osemeeting` additionally needs the vision model: `ollama pull qwen2.5vl:3b`.
 - **Lark console → Events & Callbacks →** subscription mode **"Use long connection"**,
   subscribe to event **`im.message.receive_v1`**. Do NOT also set a Request URL.
 - **Scopes** (add + publish a version): `im:message`, `wiki:wiki:readonly`,
