@@ -4903,13 +4903,38 @@ def _deploy_try_handle_im_message(
         [b[:80] for b in deploy_blobs[:4]],
     )
 
+    # The @-gate is checked FIRST so that every deliberate request gets an answer. Ordering it
+    # after the enable/authorize checks meant DEPLOY_ENABLE=0 plus an unauthorized sender
+    # swallowed the message in total silence — the feature looked dead with no way to tell why.
+    # Passing this gate means the bot was actually @-mentioned (or DM'd), so replying below is
+    # answering someone who asked, not volunteering config into a group that didn't.
+    if not _deploy_bot_addressed(
+        raw_text,
+        mentions,
+        content_at_entity_ids,
+        msg,
+        im_chat_type,
+    ):
+        logger.info("deploy request skip — @ not addressed to this bot")
+        try:
+            _deploy_reply(
+                chat_id,
+                open_id,
+                "🚀 Deploy (p0bot): please @ **p0bot** in this group, then send "
+                "`/deploy` — or: git pull origin main and restart service",
+            )
+        except Exception:
+            logger.exception("deploy @-gate feedback failed")
+        return True
+
     if not DEPLOY_ENABLE:
         logger.warning("deploy-like message but DEPLOY_ENABLE=0")
-        if _deploy_sender_authorized(sender, open_id or "", send_wrap):
-            try:
-                _deploy_reply(chat_id, open_id, "🚀 Deploy (p0bot): disabled (DEPLOY_ENABLE=0).")
-            except Exception:
-                logger.exception("deploy disabled feedback failed")
+        try:
+            _deploy_reply(chat_id, open_id,
+                          "🚀 Deploy (p0bot): 已停用 / disabled — set `DEPLOY_ENABLE=1` in "
+                          "`/root/p0bot/.env`, then `systemctl restart p0bot`.")
+        except Exception:
+            logger.exception("deploy disabled feedback failed")
         return True
 
     if not _deploy_sender_authorized(sender, open_id or "", send_wrap):
@@ -4936,25 +4961,6 @@ def _deploy_try_handle_im_message(
             )
         except Exception:
             logger.exception("deploy unauthorized feedback failed")
-        return True
-
-    if not _deploy_bot_addressed(
-        raw_text,
-        mentions,
-        content_at_entity_ids,
-        msg,
-        im_chat_type,
-    ):
-        logger.info("deploy request skip — @ not addressed to this bot")
-        try:
-            _deploy_reply(
-                chat_id,
-                open_id,
-                "🚀 Deploy (p0bot): please @ **p0bot** in this group, then send "
-                "`/deploy` — or: git pull origin main and restart service",
-            )
-        except Exception:
-            logger.exception("deploy @-gate feedback failed")
         return True
 
     processed_stick_d = _monitoring_processed_stick(
