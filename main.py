@@ -4928,11 +4928,24 @@ def _deploy_try_handle_im_message(
         return True
 
     if not DEPLOY_ENABLE:
-        logger.warning("deploy-like message but DEPLOY_ENABLE=0")
+        # Echo the RAW value the process actually saw. main.py never reads .env itself — only
+        # systemd does, via EnvironmentFile, and only at service start. So "disabled" despite a
+        # .env saying 1 always means one of: the service was not restarted after the edit, a
+        # later duplicate DEPLOY_ENABLE line won, or the value carries something extra (an inline
+        # `# comment` is part of the value for systemd, and only 1/true/yes/on count as true).
+        raw_enable = _cfg_raw("DEPLOY_ENABLE")
+        logger.warning("deploy-like message but DEPLOY_ENABLE is falsy (raw=%r)", raw_enable)
         try:
-            _deploy_reply(chat_id, open_id,
-                          "🚀 Deploy (p0bot): 已停用 / disabled — set `DEPLOY_ENABLE=1` in "
-                          "`/root/p0bot/.env`, then `systemctl restart p0bot`.")
+            _deploy_reply(
+                chat_id, open_id,
+                "🚀 Deploy (p0bot): 已停用 / disabled.\n"
+                f"进程实际读到 / the process actually sees: `DEPLOY_ENABLE={raw_enable!r}`\n"
+                "只有 `1`/`true`/`yes`/`on` 算开启。改 `/root/p0bot/.env` 后必须 "
+                "`systemctl restart p0bot`（systemd 只在启动时读 EnvironmentFile），"
+                "并确认文件里没有第二行 `DEPLOY_ENABLE=0`。/ Only `1`/`true`/`yes`/`on` count. "
+                "After editing `.env` you MUST `systemctl restart p0bot` (systemd reads "
+                "EnvironmentFile only at start), and check there is no second "
+                "`DEPLOY_ENABLE=0` line later in the file.")
         except Exception:
             logger.exception("deploy disabled feedback failed")
         return True
