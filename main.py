@@ -469,9 +469,18 @@ _CFG: Dict[str, Any] = {
     # model ever sees them (a screen share that sits still for 5 minutes costs one look, not 15).
     "P0_OSEMEETING_FRAME_INTERVAL_SECONDS": "20",
     "P0_OSEMEETING_FRAME_WIDTH": "1280",
-    # Mean 0..255 pixel distance (on a 16x16 grey thumbnail) below which two sampled frames count
-    # as the same screen. Raise it to dedupe harder, lower it to keep subtler changes.
-    "P0_OSEMEETING_FRAME_DEDUPE_THRESHOLD": "3.0",
+    # Two ways a sampled frame counts as a NEW screen rather than a near-duplicate. Either the mean
+    # 0..255 distance over the grey thumbnail reaches THRESHOLD (a whole-screen change), or at least
+    # FRACTION of the thumbnail's pixels moved by more than PIXEL_DELTA (a localised change — the
+    # dashboard number, the scrolled log, the swapped slide text that a mean average hides).
+    # Lower either one to keep more frames; raise them to dedupe harder.
+    "P0_OSEMEETING_FRAME_DEDUPE_THRESHOLD": "0.8",
+    "P0_OSEMEETING_FRAME_DEDUPE_FRACTION": "0.01",
+    "P0_OSEMEETING_FRAME_DEDUPE_PIXEL_DELTA": "12",
+    # Wall-clock ceiling for the whole vision pass. Every deduped frame is judged (no early exit on
+    # the image cap), so this bounds the cost; frames are judged in a spread order, so running out
+    # of budget loses resolution evenly across the meeting instead of skipping its second half.
+    "P0_OSEMEETING_VISION_BUDGET_SECONDS": "900",
     # Hard caps: distinct frames shown to the vision model, and images finally embedded in the doc.
     "P0_OSEMEETING_MAX_FRAMES": "120",
     "P0_OSEMEETING_MAX_IMAGES": "8",
@@ -480,11 +489,26 @@ _CFG: Dict[str, Any] = {
     # ---- text → minutes: the writer model (empty = P0_QA_MODEL / MONITORING_AI_MODEL) ----
     "P0_OSEMEETING_WRITER_MODEL": "",
     "P0_OSEMEETING_PROMPT": "",
+    # Context window for the writer call. Deliberately its own key rather than borrowing
+    # P0_QA_NUM_CTX: num_ctx covers prompt AND output, and this output (bilingual topics) is far
+    # bigger than a Q&A answer. OUTPUT_TOKENS is reserved for the answer and the transcript is then
+    # sized to whatever is left — without that reservation generation stops mid-JSON on a long
+    # Chinese meeting, which reads to the user as "writer output was not valid JSON".
+    "P0_OSEMEETING_NUM_CTX": "32768",
+    "P0_OSEMEETING_OUTPUT_TOKENS": "10000",
     # Max transcript characters handed to the writer (head+tail kept when longer).
     "P0_OSEMEETING_TRANSCRIPT_CHARS": "24000",
-    # Max discussion topics written per language section (the template ships with 4 slots; extra
-    # topics get new headings appended, unused slots are left untouched).
-    "P0_OSEMEETING_MAX_TOPICS": "10",
+    # Ceiling, not a target. The template ships with 4 numbered slots and the bot APPENDS headings
+    # for everything past them, so a meeting that covered 12 subjects gets 12 topics in each language
+    # section. Kept generous deliberately: merging unrelated subjects to fit a limit loses
+    # information, and the output-token reserve above is what actually bounds the answer's length.
+    "P0_OSEMEETING_MAX_TOPICS": "20",
+    # Seconds between docx writes. /p0docs has always slept 0.34 s per patch ("docx write QPS limit
+    # — bursting many patches gets throttled"); /osemeeting writes far more per run (a heading, its
+    # bullets, then a caption AND an image per screenshot) and paced none of it, which is how a real
+    # run lost a whole Chinese topic, a 3-bullet batch and 2 of 8 images to throttling. Throttled
+    # writes are also retried on the same token with backoff before another identity is tried.
+    "P0_OSEMEETING_WRITE_PACE_SECONDS": "0.34",
     # Overview table values the meeting itself cannot supply. Empty "prepared by" = the bot's name.
     "P0_OSEMEETING_PREPARED_BY": "",
     "P0_OSEMEETING_PARTICIPANTS_FALLBACK": "MY OSE",
@@ -8600,6 +8624,122 @@ def _monitoring_ai_extract_ollama_text(data: Any) -> str:
     return "\n\n".join(chunks).strip()
 
 
+def _p0_model_json(raw: str) -> Tuple[Any, str]:
+    """(parsed JSON, note). Parse model output that is *nearly* JSON.
+
+    A bare ``json.loads`` on model text is too brittle for three reasons seen in practice:
+    :func:`_monitoring_ai_extract_ollama_text` concatenates the model's ``thinking`` field with its
+    ``content``, so reasoning prose can sit next to the object; models still wrap output in ```json
+    fences even under ``format="json"``; and when prompt+output exceed ``num_ctx`` generation simply
+    STOPS, leaving valid JSON that is merely unclosed.
+
+    The last case is why this salvages rather than rejects: a cut-off response usually still holds
+    several complete records, and returning those beats discarding a multi-minute model run. ``note``
+    is non-empty whenever repair was needed, so callers can log that the output was damaged.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, "empty model output"
+    # Reasoning blocks. Closed ones are removed wholesale; an UNCLOSED <think> only has its tag
+    # dropped, never its tail — the model may have reasoned and then answered without ever closing
+    # the tag, and eating the tail would throw the answer away with it. Whatever prose remains is
+    # skipped anyway by the scan below, which starts at the first brace.
+    text = re.sub(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>", " ", text)
+    text = re.sub(r"(?is)</?think(?:ing)?>", " ", text)
+    # ```json … ``` fences (the closing fence may be missing when truncated).
+    text = re.sub(r"(?is)```[a-z0-9_-]*\s*", "", text).strip()
+    try:
+        return json.loads(text), ""
+    except ValueError:
+        pass
+    start = min([i for i in (text.find("{"), text.find("[")) if i >= 0] or [-1])
+    if start < 0:
+        return None, "no JSON object found in the model output"
+    depth, in_str, esc, end = 0, False, False, -1
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end > 0:
+        try:
+            return json.loads(text[start:end]), "extracted the JSON object from surrounding text"
+        except ValueError as e:
+            return None, f"JSON span failed to parse: {e}"
+    # Never closed -> truncated. Repair by discarding the incomplete tail and closing what is open.
+    frag = text[start:]
+    depth, in_str, esc = 0, False, False
+    stack: List[str] = []
+    safe = 0  # index INTO FRAG just past the last complete element (not into `text`)
+    for i, ch in enumerate(frag):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+                if stack and stack[-1] == "[":
+                    safe = i + 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+            depth += 1
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            depth -= 1
+            safe = i + 1
+        elif ch == "," and depth <= 2:
+            safe = i  # a comma at shallow depth is a clean place to cut
+    body = frag[:safe].rstrip().rstrip(",")
+    if not body:
+        return None, "model output was truncated with no complete element to recover"
+    kept = len(body)
+    # Re-scan the kept prefix so the closers match what is actually still open.
+    depth, in_str, esc = 0, False, False
+    stack = []
+    for ch in body:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if in_str:
+        body += '"'
+    body += "".join("}" if c == "{" else "]" for c in reversed(stack))
+    try:
+        return json.loads(body), ("model output was TRUNCATED — recovered the complete part "
+                                  f"({kept} of {len(frag)} chars)")
+    except ValueError as e:
+        return None, f"truncated model output could not be repaired: {e}"
+
+
 def _monitoring_ai_strip_model_reasoning(text: str) -> str:
     """Remove hidden reasoning blocks; keep the user-visible verdict + explanation."""
     out = (text or "").strip()
@@ -10485,7 +10625,8 @@ def _p0_whotalk_decode(seg: Any, sr: int) -> str:
 
 
 def _p0_whotalk_local_transcribe(minute_token: str, with_times: bool = False,
-                                 start_epoch: float = 0.0) -> Tuple[str, str]:
+                                 start_epoch: float = 0.0,
+                                 media_path_in: str = "") -> Tuple[str, str]:
     """(transcript_text, error). Hybrid local ASR:
 
     speaker names + timestamps from the Minutes SRT export; the TEXT of each turn is
@@ -10516,40 +10657,53 @@ def _p0_whotalk_local_transcribe(minute_token: str, with_times: bool = False,
         # SRT layout is undocumented; if this export carries no recognizable speaker labels,
         # a local transcript would lose all names — prefer the Lark text path (names known-good).
         return "", "SRT export carried no speaker labels — using Lark transcript to keep names"
-    media_url, merr = _p0_minutes_media_url(minute_token)
-    if not media_url:
-        return "", (f"media download-url failed: code={merr.get('code')} msg={merr.get('msg')} "
-                    "(scope minutes:minutes.media:export granted+published? re-/vcauth after adding it)")
+    # ``media_path_in`` lets a caller that has ALREADY downloaded the recording hand it over
+    # (/osemeeting needs the same file for its vision pass). Without it a single /osemeeting run
+    # downloads the whole recording twice — once here and once for the frames.
+    reused = bool(media_path_in) and os.path.isfile(media_path_in)
+    media_url = ""
+    if not reused:
+        media_url, merr = _p0_minutes_media_url(minute_token)
+        if not media_url:
+            return "", (f"media download-url failed: code={merr.get('code')} msg={merr.get('msg')} "
+                        "(scope minutes:minutes.media:export granted+published? "
+                        "re-/vcauth after adding it)")
     workdir = tempfile.mkdtemp(prefix="p0whotalk_")
-    media_path = os.path.join(workdir, "media.bin")
+    media_path = media_path_in if reused else os.path.join(workdir, "media.bin")
     wav_path = os.path.join(workdir, "audio.wav")
     try:
         max_mb = _cfg_int("P0_WHOTALK_ASR_MAX_MEDIA_MB", 1024)
-        # Try the URL as presigned first; if the CDN insists on auth, retry with our tokens.
-        auth_headers: List[Dict[str, str]] = [{}]
-        auth_headers += [{"Authorization": f"Bearer {tok}"} for _kind, tok in _p0_minutes_tokens()]
-        written = 0
-        last_status = "?"
-        for hdrs in auth_headers:
-            with requests.get(media_url, headers=hdrs, stream=True, timeout=120) as r:
-                last_status = str(r.status_code)
-                if r.status_code in (401, 403):
-                    continue
-                r.raise_for_status()
-                clen = int(r.headers.get("Content-Length") or 0)
-                if max_mb and clen and clen > max_mb * 1024 * 1024:
-                    return "", f"recording too large ({clen // (1024 * 1024)} MB > {max_mb} MB limit)"
-                written = 0
-                with open(media_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):
-                        f.write(chunk)
-                        written += len(chunk)
-                        if max_mb and written > max_mb * 1024 * 1024:
-                            return "", f"recording exceeded the {max_mb} MB download limit"
-            break
-        if not written:
-            return "", f"media download denied (HTTP {last_status}) with and without auth"
-        logger.info("p0 whotalk media downloaded: %d bytes", written)
+        if reused:
+            logger.info("p0 whotalk reusing an already-downloaded recording (%d bytes)",
+                        os.path.getsize(media_path))
+        if not reused:
+            # Try the URL as presigned first; if the CDN insists on auth, retry with our tokens.
+            auth_headers: List[Dict[str, str]] = [{}]
+            auth_headers += [{"Authorization": f"Bearer {tok}"}
+                             for _kind, tok in _p0_minutes_tokens()]
+            written = 0
+            last_status = "?"
+            for hdrs in auth_headers:
+                with requests.get(media_url, headers=hdrs, stream=True, timeout=120) as r:
+                    last_status = str(r.status_code)
+                    if r.status_code in (401, 403):
+                        continue
+                    r.raise_for_status()
+                    clen = int(r.headers.get("Content-Length") or 0)
+                    if max_mb and clen and clen > max_mb * 1024 * 1024:
+                        return "", (f"recording too large ({clen // (1024 * 1024)} MB > "
+                                    f"{max_mb} MB limit)")
+                    written = 0
+                    with open(media_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            f.write(chunk)
+                            written += len(chunk)
+                            if max_mb and written > max_mb * 1024 * 1024:
+                                return "", f"recording exceeded the {max_mb} MB download limit"
+                break
+            if not written:
+                return "", f"media download denied (HTTP {last_status}) with and without auth"
+            logger.info("p0 whotalk media downloaded: %d bytes", written)
         proc = subprocess.run(
             [_p0_ffmpeg_bin(), "-y", "-i", media_path, "-vn", "-ac", "1", "-ar", "16000",
              "-c:a", "pcm_s16le", "-f", "wav", wav_path],
@@ -10983,6 +11137,11 @@ def _p0_minutes_meta(minute_token: str) -> Dict[str, str]:
             if ct > 0:
                 out["meeting date"] = time.strftime("%Y/%m/%d", time.localtime(ct))
                 out["meeting start time"] = time.strftime("%Y/%m/%d %H:%M", time.localtime(ct))
+                # The display string above is minute-precision. Callers that need the origin for
+                # timestamps must use THIS instead of re-parsing that string, or every frame and
+                # transcript label inherits up to 59 s of error. Leading underscore = not a field
+                # for the model, which is fed the human-readable entries only.
+                out["_start_epoch"] = f"{ct:.3f}"
                 if dur > 0:
                     out["meeting end time"] = time.strftime("%Y/%m/%d %H:%M", time.localtime(ct + dur))
                     out["meeting duration"] = f"{int(dur // 60)} min"
@@ -11331,7 +11490,10 @@ def _p0_p0docs_ai_updates(
     doc_lines = "\n".join(
         f"[{b['id']}] {b['text']}" for b in blocks if (b.get("id") and (b.get("text") or "").strip())
     )
-    meta_lines = "\n".join(f"- {k}: {v}" for k, v in meta.items() if v)
+    # Skip internal keys (leading underscore, e.g. _start_epoch): they are plumbing, and a raw
+    # epoch offered as "metadata" is exactly the sort of value a model pastes into a field.
+    meta_lines = "\n".join(f"- {k}: {v}" for k, v in meta.items()
+                           if v and not k.startswith("_"))
     style = _cfg_str("P0_P0DOCS_PROMPT", "").strip() or (
         "You fill a P0 incident report document from a meeting transcript.\n"
         "INPUT 1 is the document: one line per block as `[block_id] current text`. Lines containing "
@@ -11411,11 +11573,13 @@ def _p0_p0docs_ai_updates(
     except Exception:
         logger.exception("p0 p0docs model call failed")
         return [], [], [], [], "模型调用失败/超时 / model call failed or timed out — check the journal"
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        logger.warning("p0 p0docs model output not JSON: %r", (raw or "")[:400])
-        return [], [], [], [], "模型输出不是有效 JSON / model output was not valid JSON — see journal"
+    parsed, jnote = _p0_model_json(raw)
+    if jnote:
+        logger.warning("p0 p0docs model output needed repair (%s); raw=%d chars head=%r tail=%r",
+                       jnote, len(raw or ""), (raw or "")[:200], (raw or "")[-200:])
+    if parsed is None:
+        return [], [], [], [], (f"模型输出不是有效 JSON / model output was not usable JSON — {jnote}"
+                                " — see journal")
     categories: List[str] = []
     if isinstance(parsed, dict) and isinstance(parsed.get("categories"), list):
         categories = [str(c).strip() for c in parsed["categories"][:4] if str(c or "").strip()]
@@ -11836,6 +12000,17 @@ _P0_OSE_NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣",
                      "5️⃣", "6️⃣", "7️⃣", "8️⃣",
                      "9️⃣", "\U0001f51f"]
 
+# Grid the frames are downscaled to for near-duplicate detection, and why it is this coarse-but-not-
+# tiny. Box-averaging cancels high-frequency content, so the smaller the grid the more invisible a
+# text edit becomes: at 32x32 each cell averages ~2,025 source pixels of a 1080p screen and measured
+# 0.00% of cells past the old delta for a scrolled terminal, a re-filled spreadsheet and a code
+# editor on another file — i.e. the localised-change criterion was dead, and the filter kept only
+# whole-screen churn like a webcam gallery, which is precisely what the vision prompt rejects.
+# 160x90 keeps the 16:9 shape and puts a text line across ~1.7 cells instead of a fraction of one.
+# Distortion from a non-16:9 recording is identical in every frame, so it cancels in the diff.
+_P0_OSE_THUMB_W = 160
+_P0_OSE_THUMB_H = 90
+
 # A heading that is a topic slot: "1️⃣ …", "1. …", "1) …", or a bare number.
 _P0_OSE_NUMBERED_RE = re.compile(
     r"^\s*(?:([1-9]️?⃣|\U0001f51f)|([1-9][0-9]?)\s*[.)、]?)\s*"
@@ -11877,7 +12052,9 @@ def _p0_ose_hhmmss(seconds: float, start_epoch: float) -> str:
     if start_epoch:
         return time.strftime("%H:%M:%S", time.localtime(start_epoch + max(0.0, seconds)))
     s = int(max(0.0, seconds))
-    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+    # No known meeting start: mark it as an OFFSET. Rendered bare it is indistinguishable from
+    # a wall clock, and readers were being handed "00:14:20" for a meeting that began at 14:30.
+    return f"+{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
 def _p0_ffprobe_bin() -> str:
@@ -11928,16 +12105,20 @@ def _p0_ose_download_media(minute_token: str, workdir: str) -> Tuple[str, str]:
     auth_headers += [{"Authorization": f"Bearer {tok}"} for _kind, tok in _p0_minutes_tokens()]
     written, last_status = 0, "?"
     for hdrs in auth_headers:
+        # Reset per ATTEMPT, not after the status checks: a stream that died half way through left
+        # a partial byte count behind, `if not written` then passed, and a truncated recording was
+        # returned as a successful download — silently transcribing only part of the meeting.
+        written = 0
+        expect = 0
         try:
             with requests.get(media_url, headers=hdrs, stream=True, timeout=180) as r:
                 last_status = str(r.status_code)
                 if r.status_code in (401, 403):
                     continue
                 r.raise_for_status()
-                clen = int(r.headers.get("Content-Length") or 0)
-                if max_mb and clen and clen > max_mb * 1024 * 1024:
-                    return "", f"recording too large ({clen // (1024 * 1024)} MB > {max_mb} MB limit)"
-                written = 0
+                expect = int(r.headers.get("Content-Length") or 0)
+                if max_mb and expect and expect > max_mb * 1024 * 1024:
+                    return "", f"recording too large ({expect // (1024 * 1024)} MB > {max_mb} MB limit)"
                 with open(media_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):
                         f.write(chunk)
@@ -11946,6 +12127,12 @@ def _p0_ose_download_media(minute_token: str, workdir: str) -> Tuple[str, str]:
                             return "", f"recording exceeded the {max_mb} MB download limit"
         except Exception as e:
             last_status = e.__class__.__name__
+            written = 0
+            continue
+        if expect and written != expect:
+            logger.warning("p0 osemeeting truncated download: %d of %d bytes — retrying/next token",
+                           written, expect)
+            written = 0
             continue
         break
     if not written:
@@ -11987,6 +12174,10 @@ def _p0_ose_openai_segments(media_path: str, workdir: str) -> Tuple[List[Dict[st
         )
     except subprocess.TimeoutExpired:
         return [], "ffmpeg timed out splitting the audio"
+    except OSError as e:
+        # FileNotFoundError/PermissionError are OSError, not SubprocessError — uncaught they escaped
+        # _p0_ose_transcript entirely and skipped the local-ASR and Lark rungs below it.
+        return [], f"ffmpeg unavailable ({e.__class__.__name__}: {e}) — set P0_FFMPEG_BIN or install it"
     chunks = sorted(f for f in os.listdir(adir) if f.startswith("chunk_") and f.endswith(".mp3"))
     if not chunks:
         tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
@@ -12113,7 +12304,7 @@ def _p0_ose_sample_frames(media_path: str, workdir: str,
     """
     interval = max(2, _cfg_int("P0_OSEMEETING_FRAME_INTERVAL_SECONDS", 20))
     width = max(320, _cfg_int("P0_OSEMEETING_FRAME_WIDTH", 1280))
-    thresh = max(0.0, _cfg_float("P0_OSEMEETING_FRAME_DEDUPE_THRESHOLD", 3.0))
+    thresh = max(0.0, _cfg_float("P0_OSEMEETING_FRAME_DEDUPE_THRESHOLD", 0.8))
     cap = max(1, _cfg_int("P0_OSEMEETING_MAX_FRAMES", 120))
 
     fdir = os.path.join(workdir, "frames")
@@ -12124,27 +12315,43 @@ def _p0_ose_sample_frames(media_path: str, workdir: str,
             [_p0_ffmpeg_bin(), "-y", "-i", media_path,
              "-vf", f"fps=1/{interval},scale={width}:-2", "-q:v", "4",
              os.path.join(fdir, "f_%05d.jpg"),
-             "-vf", f"fps=1/{interval},scale=16:16,format=gray",
+             "-vf", f"fps=1/{interval},scale={_P0_OSE_THUMB_W}:{_P0_OSE_THUMB_H},format=gray",
              "-f", "rawvideo", raw_path],
             capture_output=True, timeout=1800,
         )
     except subprocess.TimeoutExpired:
         return [], "ffmpeg timed out extracting frames"
+    except OSError as e:
+        return [], f"ffmpeg unavailable ({e.__class__.__name__}: {e}) — set P0_FFMPEG_BIN or install it"
     jpgs = sorted(f for f in os.listdir(fdir) if f.startswith("f_") and f.endswith(".jpg"))
     if not jpgs:
         tail = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
         return [], f"no frames extracted (rc={proc.returncode}) — audio-only recording? {tail}"
 
     # Dedupe on the grey thumbnails when we got them; otherwise keep every sampled frame.
+    #
+    # Two criteria, because a mean alone has bad recall on exactly the screens that matter: when a
+    # dashboard's numbers change, a log scrolls, or a slide swaps its body text, most of the frame is
+    # identical and the MEAN difference stays under the threshold — the frame is dropped and the
+    # vision model never sees the thing worth screenshotting. So also keep a frame when a small but
+    # meaningful FRACTION of the thumbnail changed hard, which is what a localised edit looks like.
+    px = _P0_OSE_THUMB_W * _P0_OSE_THUMB_H
+    frac_min = max(0.0, _cfg_float("P0_OSEMEETING_FRAME_DEDUPE_FRACTION", 0.01))
+    px_delta = max(1, _cfg_int("P0_OSEMEETING_FRAME_DEDUPE_PIXEL_DELTA", 12))
     keep_idx: List[int] = []
     try:
         import numpy as np  # deferred: only needed when the vision pass runs
 
         buf = np.frombuffer(open(raw_path, "rb").read(), dtype=np.uint8)
-        thumbs = buf[: (len(buf) // 256) * 256].reshape(-1, 256).astype(np.int16)
+        thumbs = buf[: (len(buf) // px) * px].reshape(-1, px).astype(np.int16)
         last = None
         for i in range(min(len(thumbs), len(jpgs))):
-            if last is None or float(np.abs(thumbs[i] - last).mean()) >= thresh:
+            if last is None:
+                keep_idx.append(i)
+                last = thumbs[i]
+                continue
+            d = np.abs(thumbs[i] - last)
+            if float(d.mean()) >= thresh or float((d > px_delta).mean()) >= frac_min:
                 keep_idx.append(i)
                 last = thumbs[i]
     except Exception as e:
@@ -12158,13 +12365,55 @@ def _p0_ose_sample_frames(media_path: str, workdir: str,
     dropped = len(jpgs) - len(frames)
     if len(frames) > cap:
         # Thin evenly rather than truncating, so the late half of the meeting is still represented.
-        step = len(frames) / float(cap)
-        frames = [frames[int(i * step)] for i in range(cap)]
+        frames = _p0_ose_thin(frames, cap)
         logger.info("p0 osemeeting frames thinned to the P0_OSEMEETING_MAX_FRAMES cap of %d", cap)
     logger.info("p0 osemeeting frames: %d sampled every %ds, %d near-duplicates dropped, "
                 "%d going to %s", len(jpgs), interval, dropped, len(frames),
                 _cfg_str("P0_OSEMEETING_VISION_MODEL", "qwen2.5vl:3b"))
     return frames, ""
+
+
+def _p0_ose_thin(seq: List[Any], cap: int) -> List[Any]:
+    """Reduce ``seq`` to at most ``cap`` items spread evenly, KEEPING BOTH ENDS.
+
+    The obvious ``seq[int(i * len/cap)]`` is subtly wrong: its largest reachable index is
+    ``int((cap-1) * len/cap)``, which is always below ``len-1`` — so the meeting's final screenshot
+    was silently dropped on every run that hit the cap.
+    """
+    n = len(seq)
+    if cap <= 0 or n <= cap:
+        return list(seq)
+    if cap == 1:
+        return [seq[0]]
+    idx = sorted({int(round(i * (n - 1) / (cap - 1))) for i in range(cap)})
+    return [seq[i] for i in idx]
+
+
+def _p0_ose_spread_order(n: int) -> List[int]:
+    """Indices 0..n-1 ordered so that ANY prefix is spread evenly over the whole range.
+
+    Ends first, then midpoints of progressively finer subdivisions. This is what makes the vision
+    pass safe to cut short: whatever it got through still covers the whole meeting instead of only
+    its opening minutes.
+    """
+    if n <= 0:
+        return []
+    seen: Set[int] = set()
+    out: List[int] = []
+    denom = 1
+    while len(out) < n and denom <= max(1, n) * 2:
+        for num in range(denom + 1):
+            i = int(round(num * (n - 1) / float(denom)))
+            i = min(n - 1, max(0, i))
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        denom *= 2
+    for i in range(n):
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
 
 
 def _p0_ose_vision_pick(frames: List[Dict[str, Any]],
@@ -12192,9 +12441,21 @@ def _p0_ose_vision_pick(frames: List[Dict[str, Any]],
     kept: List[Dict[str, Any]] = []
     t0 = time.time()
     looked = 0
-    for fr in frames:
-        if max_imgs and len(kept) >= max_imgs:
-            logger.info("p0 osemeeting vision: hit the %d-image cap, stopping early", max_imgs)
+    rejected = errors = skipped = 0
+    budget = max(60.0, _cfg_float("P0_OSEMEETING_VISION_BUDGET_SECONDS", 900.0))
+    # NO early break on the image cap. Frames arrive in chronological order, so stopping at the
+    # first N keepers meant a meeting whose real screen-share happened after the halfway mark was
+    # never looked at at all — the single largest cause of "it didn't capture that picture".
+    # Every candidate is judged and the cap is applied afterwards. Judging all of them costs real
+    # time, so a wall-clock budget bounds it, and the spread order means being cut short loses
+    # resolution evenly across the meeting rather than amputating its second half.
+    for pos in _p0_ose_spread_order(len(frames)):
+        fr = frames[pos]
+        if time.time() - t0 > budget:
+            skipped = len(frames) - looked - errors
+            logger.warning("p0 osemeeting vision: %.0fs budget spent after %d frames — %d not "
+                           "examined (raise P0_OSEMEETING_VISION_BUDGET_SECONDS or "
+                           "P0_OSEMEETING_FRAME_INTERVAL_SECONDS)", budget, looked, max(0, skipped))
             break
         try:
             with open(fr["path"], "rb") as fh:
@@ -12214,23 +12475,38 @@ def _p0_ose_vision_pick(frames: List[Dict[str, Any]],
             raw = _monitoring_ai_extract_ollama_text(r.json())
             looked += 1
         except Exception as e:
+            errors += 1
             logger.info("p0 osemeeting vision call failed at t=%ss: %s: %s",
                         int(fr["t"]), e.__class__.__name__, e)
             continue
-        try:
-            parsed = json.loads(raw or "{}")
-        except ValueError:
+        parsed, _vnote = _p0_model_json(raw)
+        if parsed is None:
+            errors += 1
             logger.info("p0 osemeeting vision output not JSON at t=%ss: %r",
                         int(fr["t"]), (raw or "")[:160])
             continue
-        if not isinstance(parsed, dict) or not parsed.get("keep"):
+        keep_val = parsed.get("keep") if isinstance(parsed, dict) else None
+        if isinstance(keep_val, str):
+            # Small models answer with the STRING "false", which is truthy in Python.
+            keep_val = keep_val.strip().lower() in ("1", "true", "yes", "y")
+        if not isinstance(parsed, dict) or not keep_val:
+            rejected += 1
             continue
         cap_txt = str(parsed.get("caption") or "").strip()[:300]
         kept.append({"path": fr["path"], "t": fr["t"],
                      "clock": _p0_ose_hhmmss(fr["t"], start_epoch),
                      "caption": cap_txt or "Screen shared during the meeting"})
-    logger.info("p0 osemeeting vision (%s): looked at %d frames, kept %d, %.1fs",
-                model, looked, len(kept), time.time() - t0)
+    kept.sort(key=lambda f: f["t"])  # judged in spread order, but the doc wants chronological
+    logger.info("p0 osemeeting vision (%s): looked at %d frames, kept %d, rejected %d, "
+                "errored %d, skipped %d, %.1fs", model, looked, len(kept), rejected, errors,
+                skipped, time.time() - t0)
+    if max_imgs and len(kept) > max_imgs:
+        # Thin ACROSS the meeting rather than taking the first N, so the cap costs coverage evenly
+        # instead of silently discarding everything after the early keepers.
+        picked = _p0_ose_thin(kept, max_imgs)
+        logger.info("p0 osemeeting vision: %d keepers thinned to the %d-image cap, spread over "
+                    "%s–%s", len(kept), max_imgs, picked[0]["clock"], picked[-1]["clock"])
+        return picked
     return kept
 
 
@@ -12243,15 +12519,27 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
     model = _p0_ose_writer_model()
     timeout = max(30.0, _cfg_float("P0_WHOTALK_QA_TIMEOUT_SECONDS",
                                    max(900.0, _cfg_float("P0_QA_TIMEOUT_SECONDS", 600.0))))
-    num_ctx = max(4096, _cfg_int("P0_QA_NUM_CTX", 16384))
-    max_topics = max(1, _cfg_int("P0_OSEMEETING_MAX_TOPICS", 10))
-    cap = max(4000, _cfg_int("P0_OSEMEETING_TRANSCRIPT_CHARS", 24000))
+    num_ctx = max(8192, _cfg_int("P0_OSEMEETING_NUM_CTX", 32768))
+    max_topics = max(1, _cfg_int("P0_OSEMEETING_MAX_TOPICS", 20))
+    # num_ctx covers prompt AND generated output, and this output is big: bilingual topics run to
+    # thousands of tokens. Reserve that room up front, then size the transcript to what is left —
+    # otherwise generation simply stops mid-JSON when the window fills. Chinese costs roughly one
+    # token per character, so budget at that (pessimistic) rate rather than the ~4 chars/token that
+    # English would suggest.
+    reserve = max(2048, _cfg_int("P0_OSEMEETING_OUTPUT_TOKENS", 10000))
+    room_chars = max(2000, int((num_ctx - reserve) * 1.0) - 4000)  # 4000 ≈ system prompt + frames
+    cap = max(2000, _cfg_int("P0_OSEMEETING_TRANSCRIPT_CHARS", 24000))
+    if cap > room_chars:
+        logger.info("p0 osemeeting: transcript cap %d trimmed to %d to fit num_ctx=%d "
+                    "(reserving %d tokens for the answer)", cap, room_chars, num_ctx, reserve)
+        cap = room_chars
     tr = transcript or ""
     if len(tr) > cap:
         head = int(cap * 0.7)
         tr = tr[:head] + "\n…(中间省略/omitted)…\n" + tr[-(cap - head):]
     shots = "\n".join(f"[{i}] {f['clock']} — {f['caption']}" for i, f in enumerate(frames)) or "-"
-    meta_lines = "\n".join(f"- {k}: {v}" for k, v in meta.items() if v) or "-"
+    meta_lines = "\n".join(f"- {k}: {v}" for k, v in meta.items()
+                           if v and not k.startswith("_")) or "-"
     style = _cfg_str("P0_OSEMEETING_PROMPT", "").strip() or (
         "You write the minutes of an OSE (operations) team meeting into a bilingual template.\n"
         "INPUT 1 is metadata. INPUT 2 is the timed, speaker-labelled transcript (mixed Chinese and "
@@ -12265,10 +12553,15 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
         "              \"zh_bullets\": [\"<same content in 中文>\", ...],\n"
         "              \"frames\": [<INPUT 3 indexes that belong to this topic>]}]}\n"
         "Rules:\n"
-        f"1) Write between 1 and {max_topics} topics, ordered as the meeting covered them. Group the "
-        "discussion by SUBJECT, not by speaker — one topic per thing the team actually talked about.\n"
+        f"1) Write ONE topic for EVERY distinct subject the meeting covered, in the order it came up, "
+        f"up to {max_topics}. Be exhaustive: a 40-minute meeting normally yields 6-12 topics. Group by "
+        "SUBJECT, not by speaker. NEVER merge two unrelated subjects to keep the list short and never "
+        "stop early because the important ones are covered — a subject left out is information lost, "
+        "and there is no reward for brevity here. Small items (a question answered, a follow-up "
+        "assigned, a heads-up given) are still topics.\n"
         "2) en_bullets and zh_bullets must be the SAME content in the two languages, bullet for "
-        "bullet and in the same order. Each list holds 1-6 bullets. A bullet is one complete, "
+        "bullet and in the same order. Keep each list to 1-4 tight bullets — spend the room on "
+        "covering more topics rather than on longer bullets under a few. A bullet is one complete, "
         "self-contained sentence a reader who missed the meeting can act on.\n"
         "3) Record what matters: the problem or topic raised, who raised it, findings, numbers and "
         "dates that were stated, decisions taken, action items with their owner, and anything left "
@@ -12278,8 +12571,12 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
         "5) Leave out pure filler — greetings, OK/嗯/好的, small talk, repeats, sound checks.\n"
         "6) Titles are short noun phrases (2-8 words), no numbering and no trailing punctuation — "
         "the numbering is added by the system.\n"
-        "7) \"frames\": only the indexes whose caption clearly relates to that topic; the same index "
-        "must not appear under two topics, and an index that fits nothing is simply left out.\n"
+        "7) \"frames\": match screenshots to topics BY TIME FIRST. Every INPUT 3 line starts with the "
+        "clock time the screenshot was taken, and every INPUT 2 transcript line starts with the clock "
+        "time it was spoken — so a screenshot belongs to whichever topic was being discussed at that "
+        "moment. Use the caption only to confirm or to break a tie, never instead of the time. Assign "
+        "EVERY index to exactly one topic; the same index must not appear twice. Do not leave an index "
+        "out because its caption is vague — place it with the topic that owns its timestamp.\n"
         "8) overview.date: the meeting date from the metadata, formatted YYYY/MM/DD. "
         "overview.participants: the speakers actually heard in the transcript, comma separated; "
         "leave it \"\" when the transcript carries no names.\n"
@@ -12294,7 +12591,7 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
         "stream": False,
         "format": "json",
         "messages": [{"role": "system", "content": style}, {"role": "user", "content": user}],
-        "options": {"temperature": 0.2, "num_ctx": num_ctx},
+        "options": {"temperature": 0.2, "num_ctx": num_ctx, "num_predict": reserve},
         "think": False,
     }
     try:
@@ -12304,21 +12601,35 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
     except Exception:
         logger.exception("p0 osemeeting writer call failed")
         return {}, "模型调用失败/超时 / writer model call failed or timed out — check the journal"
-    try:
-        parsed = json.loads(raw or "{}")
-    except ValueError:
-        logger.warning("p0 osemeeting writer output not JSON: %r", (raw or "")[:400])
-        return {}, "模型输出不是有效 JSON / writer output was not valid JSON — see journal"
+    parsed, jnote = _p0_model_json(raw)
+    if jnote:
+        # Log both ends: a truncation shows up as a clean head and a chopped tail, and only the
+        # tail tells them apart from "the model answered with prose".
+        logger.warning("p0 osemeeting writer output needed repair (%s); raw=%d chars "
+                       "head=%r tail=%r", jnote, len(raw or ""), (raw or "")[:200],
+                       (raw or "")[-200:])
     if not isinstance(parsed, dict):
-        return {}, "模型输出不是对象 / writer output was not a JSON object"
+        logger.warning("p0 osemeeting writer output unusable: %s; raw=%r", jnote, (raw or "")[:400])
+        return {}, (f"模型输出不是有效 JSON / writer output was not usable JSON — {jnote}。"
+                    "journal 里有原始输出的头尾 / the journal has the raw head+tail "
+                    "(`p0 osemeeting writer output`)")
 
     used: Set[int] = set()
     topics: List[Dict[str, Any]] = []
     for t in (parsed.get("topics") or [])[:max_topics]:
         if not isinstance(t, dict):
             continue
-        en_b = [str(b).strip() for b in (t.get("en_bullets") or []) if str(b or "").strip()][:6]
-        zh_b = [str(b).strip() for b in (t.get("zh_bullets") or []) if str(b or "").strip()][:6]
+        def _bullets(v: Any) -> List[str]:
+            # A bare string here used to be iterated character by character, writing one-letter
+            # bullets into the doc; treat it as a single bullet instead.
+            if isinstance(v, str):
+                v = [v]
+            if not isinstance(v, list):
+                return []
+            return [str(b).strip() for b in v if str(b or "").strip()][:6]
+
+        en_b = _bullets(t.get("en_bullets"))
+        zh_b = _bullets(t.get("zh_bullets"))
         en_t = str(t.get("en_title") or "").strip()
         zh_t = str(t.get("zh_title") or "").strip()
         if not (en_t or zh_t) or not (en_b or zh_b):
@@ -12338,12 +12649,41 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
         })
     if not topics:
         return {}, "模型没有写出任何议题 / the writer produced no topics — see journal"
+    # Every frame the vision model kept has to reach the doc. The writer matches frames to topics
+    # from a single caption line, so it routinely leaves some unassigned — and silently dropping
+    # those is precisely the "it captured the picture but the picture isn't in the doc" complaint.
+    # Attach each leftover to the topic owning the nearest-in-time placed frame, else the last topic.
+    unplaced = [i for i in range(len(frames)) if i not in used]
+    if unplaced and topics:
+        anchors: List[Tuple[float, int]] = []
+        for ti, t in enumerate(topics):
+            for k in t["frames"]:
+                anchors.append((float(frames[k]["t"]), ti))
+        # Topics carry no timestamps of their own, but they ARE in the order the meeting covered
+        # them — so a topic the writer gave no frames still gets a position: its proportional share
+        # of the meeting. Without this, a late screenshot lands under the first topic simply because
+        # that was the only topic holding an anchor.
+        times = [float(f["t"]) for f in frames] or [0.0]
+        lo, hi = min(times), max(times)
+        span = max(1.0, hi - lo)
+        placed_topics = {ti for _t, ti in anchors}
+        for ti in range(len(topics)):
+            if ti not in placed_topics:
+                anchors.append((lo + (ti + 0.5) / len(topics) * span, ti))
+        for k in unplaced:
+            tk = float(frames[k]["t"])
+            ti = min(anchors, key=lambda a: abs(a[0] - tk))[1]
+            topics[ti].setdefault("_extra_frames", []).append(k)
+
     ov = parsed.get("overview") if isinstance(parsed.get("overview"), dict) else {}
     out = {
         "overview": {"date": str((ov or {}).get("date") or "").strip(),
                      "participants": str((ov or {}).get("participants") or "").strip()},
         "topics": topics,
-        "unplaced_frames": [i for i in range(len(frames)) if i not in used],
+        "auto_placed_frames": unplaced,
+        # Non-empty when the model output had to be repaired. Surfaced on the result card because a
+        # truncated answer means topics were LOST — the doc looks fine but is silently incomplete.
+        "note": jnote,
     }
     logger.info("p0 osemeeting writer (%s): %d topics, %d/%d screenshots placed; raw head=%r",
                 model, len(topics), len(used), len(frames), (raw or "")[:300])
@@ -12351,35 +12691,69 @@ def _p0_ose_ai_minutes(transcript: str, frames: List[Dict[str, Any]], meta: Dict
         logger.info("p0 osemeeting: %d topics vs %d template slots — the extras get new headings",
                     len(topics), topic_slots)
     return out, ""
+
+
 # ---- writing into the docx ------------------------------------------------------------------
+
+# Lark answers a write burst with these; they are worth waiting out rather than giving up on.
+_P0_LARK_RETRY_CODES = frozenset({99991400, 1061045, 1254045, 1061002})
+
+
+def _p0_lark_should_retry(status: int, code: Any) -> bool:
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        c = -1
+    return status in (429, 500, 502, 503, 504) or c in _P0_LARK_RETRY_CODES
+
+
+def _p0_docx_write_pace() -> float:
+    """Seconds to wait between docx writes. /p0docs has always slept 0.34 s per patch with the note
+    'docx write QPS limit — bursting many patches gets throttled'; /osemeeting writes far MORE per
+    run (heading + bullets + a caption and an image per screenshot) and was pacing none of it."""
+    return max(0.0, _cfg_float("P0_OSEMEETING_WRITE_PACE_SECONDS", 0.34))
+
 
 def _p0_docx_create_children(document_id: str, parent_id: str, index: int,
                              children: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
-    """(ids of the created blocks, error). ``index`` is the position in the parent's child list."""
+    """(ids of the created blocks, error). ``index`` is the position in the parent's child list.
+
+    Retries a throttled write on the SAME token with backoff before moving to the next identity —
+    trying a second identity instantly is no retry at all, because both are the same app hitting the
+    same per-document write budget microseconds apart.
+    """
     if not children:
         return [], {}
     body = {"index": max(0, index), "children": children}
     last_err: Dict[str, Any] = {"code": "NO_TOKEN", "msg": "no usable token"}
     for kind, tok in _p0_minutes_tokens():
-        try:
-            r = requests.post(
-                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}/blocks/{parent_id}/children",
-                headers={"Authorization": f"Bearer {tok}",
-                         "Content-Type": "application/json; charset=utf-8"},
-                params={"document_revision_id": -1},
-                json=body,
-                timeout=30,
-            )
-            j = r.json()
-        except Exception as e:
-            last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
-            continue
-        if int(j.get("code", -1)) == 0:
-            made = (j.get("data") or {}).get("children") or []
-            return [str(b.get("block_id") or "") for b in made if isinstance(b, dict)], {}
-        last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg"), "http": r.status_code}
-        logger.info("p0 osemeeting create children under %s via %s token failed http=%s body=%r",
-                    parent_id, kind, r.status_code, (r.text or "")[:200])
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}"
+                    f"/blocks/{parent_id}/children",
+                    headers={"Authorization": f"Bearer {tok}",
+                             "Content-Type": "application/json; charset=utf-8"},
+                    params={"document_revision_id": -1},
+                    json=body,
+                    timeout=30,
+                )
+                j = r.json()
+            except Exception as e:
+                last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
+                break
+            if int(j.get("code", -1)) == 0:
+                made = (j.get("data") or {}).get("children") or []
+                return [str(b.get("block_id") or "") for b in made
+                        if isinstance(b, dict)], {}
+            last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg"),
+                        "http": r.status_code}
+            if attempt < 2 and _p0_lark_should_retry(r.status_code, j.get("code")):
+                time.sleep(0.5 + attempt)
+                continue
+            logger.info("p0 osemeeting create children under %s via %s token failed http=%s body=%r",
+                        parent_id, kind, r.status_code, (r.text or "")[:200])
+            break
     return [], last_err
 
 
@@ -12390,20 +12764,58 @@ def _p0_ose_text_block(kind: str, text: str) -> Dict[str, Any]:
             kind: {"elements": [{"text_run": {"content": text}}]}}
 
 
+def _p0_docx_delete_child(document_id: str, parent_id: str, index: int) -> bool:
+    """Delete the child at ``index`` under ``parent_id``. Used to clean up an image block whose
+    upload failed — left in place it renders as a broken placeholder in the doc."""
+    for kind, tok in _p0_minutes_tokens():
+        try:
+            r = requests.delete(
+                f"{_lark_api_domain()}/open-apis/docx/v1/documents/{document_id}"
+                f"/blocks/{parent_id}/children/batch_delete",
+                headers={"Authorization": f"Bearer {tok}",
+                         "Content-Type": "application/json; charset=utf-8"},
+                params={"document_revision_id": -1},
+                json={"start_index": index, "end_index": index + 1},
+                timeout=30,
+            )
+            j = r.json()
+        except Exception:
+            continue
+        if int(j.get("code", -1)) == 0:
+            return True
+        logger.info("p0 osemeeting orphan image block delete via %s failed: code=%s msg=%s",
+                    kind, j.get("code"), j.get("msg"))
+    return False
+
+
 def _p0_docx_insert_image(document_id: str, parent_id: str, index: int,
-                          jpg_path: str) -> Tuple[bool, Dict[str, Any]]:
-    """Put one local image into the doc: empty image block -> upload the bytes -> point the block
-    at the uploaded file. Needs the drive:drive scope on top of docx:document."""
+                          jpg_path: str) -> Tuple[bool, Dict[str, Any], bool]:
+    """(ok, error, index_occupied). Put one local image into the doc: empty image block -> upload
+    the bytes -> point the block at the uploaded file. Needs drive:drive on top of docx:document.
+
+    ``index_occupied`` tells the caller whether a block still sits at ``index`` afterwards. That
+    matters on failure: the empty block is created FIRST, so a failed upload leaves a broken
+    placeholder behind. This tries to delete it, and reports honestly when it could not — without
+    that, the caller's running index falls behind the parent's real child count and every later
+    caption and image under the same heading lands one slot too early.
+    """
     ids, err = _p0_docx_create_children(document_id, parent_id, index,
                                         [{"block_type": 27, "image": {"token": ""}}])
     if not ids or not ids[0]:
-        return False, err or {"code": "NO_BLOCK", "msg": "image block not created"}
+        return False, err or {"code": "NO_BLOCK", "msg": "image block not created"}, False
     img_block = ids[0]
+
+    def _fail(e: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], bool]:
+        if _p0_docx_delete_child(document_id, parent_id, index):
+            return False, e, False
+        logger.warning("p0 osemeeting left an empty image block in %s (upload failed and the "
+                       "cleanup delete failed too)", document_id)
+        return False, e, True
     try:
         size = os.path.getsize(jpg_path)
         blob = open(jpg_path, "rb").read()
     except OSError as e:
-        return False, {"code": -1, "msg": f"cannot read {jpg_path}: {e.__class__.__name__}"}
+        return _fail({"code": -1, "msg": f"cannot read {jpg_path}: {e.__class__.__name__}"})
     name = os.path.basename(jpg_path)
     file_token, last_err = "", {"code": "NO_TOKEN", "msg": "no usable token"}
     for kind, tok in _p0_minutes_tokens():
@@ -12428,7 +12840,7 @@ def _p0_docx_insert_image(document_id: str, parent_id: str, index: int,
         logger.info("p0 osemeeting media upload via %s token failed http=%s body=%r",
                     kind, r.status_code, (r.text or "")[:200])
     if not file_token:
-        return False, last_err
+        return _fail(last_err)
     for kind, tok in _p0_minutes_tokens():
         try:
             r = requests.patch(
@@ -12444,9 +12856,9 @@ def _p0_docx_insert_image(document_id: str, parent_id: str, index: int,
             last_err = {"code": -1, "msg": f"network error: {e.__class__.__name__}"}
             continue
         if int(j.get("code", -1)) == 0:
-            return True, {}
+            return True, {}, True
         last_err = {"token": kind, "code": j.get("code"), "msg": j.get("msg")}
-    return False, last_err
+    return _fail(last_err)
 
 
 def _p0_ose_norm_label(text: str) -> str:
@@ -12549,6 +12961,7 @@ def _p0_ose_write_section(document_id: str, layout: Dict[str, Any], lang: str,
     by_id = layout["by_id"]
     tkey, bkey = (f"{lang}_title", f"{lang}_bullets")
     stat = {"headings": 0, "bullets": 0, "images": 0, "failed": 0}
+    pace = _p0_docx_write_pace()
     slots = list(sec["slots"])
     insert_at = int(sec["insert_index"])
     for n, topic in enumerate(topics):
@@ -12558,56 +12971,104 @@ def _p0_ose_write_section(document_id: str, layout: Dict[str, Any], lang: str,
         if n < len(slots):
             head_id = slots[n]
             good, err = _p0_docx_patch_block(document_id, head_id, title)
+            time.sleep(pace)
             if good:
                 stat["headings"] += 1
             else:
                 stat["failed"] += 1
                 logger.info("p0 osemeeting %s heading %d patch failed: %s", lang, n + 1, err)
-            existing = [str(k) for k in ((by_id.get(head_id) or {}).get("children") or [])]
+            # Only BULLET children are bullet slots. Including the caption/image blocks a
+            # previous run appended meant a re-run patched bullet text over a caption and tried to
+            # patch an image block, and then appended a second caption+image pair for every frame.
+            kids_all = [str(k) for k in ((by_id.get(head_id) or {}).get("children") or [])]
+            existing = [k for k in kids_all
+                        if (by_id.get(k) or {}).get("block_type") == 12]
+            prior_media = len(kids_all) - len(existing)
+            if prior_media:
+                logger.info("p0 osemeeting %s slot %s already holds %d caption/image blocks from an "
+                            "earlier run — appending after them", lang, head_id, prior_media)
         else:
             made, err = _p0_docx_create_children(
                 document_id, layout["page_id"], insert_at,
                 [_p0_ose_text_block("heading3", title)])
+            time.sleep(pace)
             if not made:
-                stat["failed"] += 1
-                logger.info("p0 osemeeting %s extra heading %d create failed: %s", lang, n + 1, err)
+                # `continue` abandons this topic's bullets and images entirely. Charging a single
+                # failure let the card report "4 headings / 14 bullets" as though one write hiccuped,
+                # when a whole topic was missing from that language.
+                stat["failed"] += 1 + len(bullets)
+                logger.info("p0 osemeeting %s topic %d LOST — heading create failed (%s); its %d "
+                            "bullets were skipped: %r", lang, n + 1, err, len(bullets), title[:60])
                 continue
-            head_id, existing = made[0], []
+            head_id, existing, kids_all, prior_media = made[0], [], [], 0
             insert_at += 1
             stat["headings"] += 1
         # Fill the bullet slots that already exist, then append whatever is left over.
         for i, text in enumerate(bullets):
             if i < len(existing):
                 good, err = _p0_docx_patch_block(document_id, existing[i], text)
+                time.sleep(pace)
                 if good:
                     stat["bullets"] += 1
                 else:
                     stat["failed"] += 1
                     logger.info("p0 osemeeting %s bullet patch failed: %s", lang, err)
         leftover = bullets[len(existing):]
+        # Index into the parent's FULL child list, not just its bullets: caption/image blocks from an
+        # earlier run sit among them, so len(existing) would splice new bullets in among the pictures.
+        child_count = len(kids_all)
         if leftover:
             made, err = _p0_docx_create_children(
-                document_id, head_id, len(existing),
+                document_id, head_id, child_count,
                 [_p0_ose_text_block("bullet", t) for t in leftover])
+            time.sleep(pace)
             if made:
                 stat["bullets"] += len(made)
+                child_count += len(made)
             else:
-                stat["failed"] += len(leftover)
-                logger.info("p0 osemeeting %s bullet create failed: %s", lang, err)
+                # One rejection used to lose the whole batch and count once per bullet. Retry them
+                # individually so a single throttled call costs at most one bullet.
+                logger.info("p0 osemeeting %s bullet batch failed (%s) — retrying one at a time",
+                            lang, err)
+                for t in leftover:
+                    one, oerr = _p0_docx_create_children(
+                        document_id, head_id, child_count, [_p0_ose_text_block("bullet", t)])
+                    time.sleep(pace)
+                    if one:
+                        stat["bullets"] += 1
+                        child_count += 1
+                    else:
+                        stat["failed"] += 1
+                        logger.info("p0 osemeeting %s single bullet create failed: %s", lang, oerr)
         if with_images:
-            at = max(len(existing), len(bullets))
-            for k in topic.get("frames") or []:
+            # Append after everything already under this heading. Deriving `at` from the bullet
+            # count alone pointed short whenever a leftover create failed or prior media existed,
+            # and Lark then rejected or mis-positioned every caption and image in the topic.
+            at = child_count
+            claimed = list(topic.get("frames") or []) + list(topic.get("_extra_frames") or [])
+            # Sort by frame time: the writer's order and the auto-placed leftovers are
+            # independent, so concatenating them put the 🖼️ clock labels out of order.
+            claimed = sorted({k for k in claimed if 0 <= k < len(frames)},
+                             key=lambda k: frames[k]["t"])
+            for k in claimed:
                 if not (0 <= k < len(frames)):
                     continue
                 fr = frames[k]
                 cap_line = f"🖼️ {fr['clock']} — {fr['caption']}"
                 made, _err = _p0_docx_create_children(
                     document_id, head_id, at, [_p0_ose_text_block("text", cap_line)])
+                time.sleep(pace)
                 at += 1 if made else 0
-                good, ierr = _p0_docx_insert_image(document_id, head_id, at, fr["path"])
+                good, ierr, occupied = _p0_docx_insert_image(
+                    document_id, head_id, at, fr["path"])
+                time.sleep(pace)
+                if occupied:
+                    # A block sits at `at` whether or not the upload worked. Advancing only on
+                    # success let the index fall behind the parent's real child count, so every
+                    # later caption and image under this heading landed a slot too early.
+                    at += 1
                 if good:
                     stat["images"] += 1
-                    at += 1
                 else:
                     stat["failed"] += 1
                     logger.info("p0 osemeeting image insert failed at %s: %s", fr["clock"], ierr)
@@ -12648,39 +13109,49 @@ def _p0_ose_transcript(minute_token: str, workdir: str,
     provider = (_cfg_str("P0_OSEMEETING_ASR_PROVIDER", "openai").strip().lower() or "openai")
     notes: List[str] = []
     media_path, duration = "", 0.0
-    if provider == "openai" and _p0_ose_openai_key():
+    # Download ONCE, up front, if anything downstream will want the recording — OpenAI ASR, the
+    # local engine, or the vision pass. Previously each fetched its own copy, so a run using local
+    # whisper plus vision pulled the whole recording twice.
+    want_media = (
+        (provider == "openai" and bool(_p0_ose_openai_key()))
+        or (provider in ("openai", "local") and _p0_whotalk_asr_enabled())
+        or _lark_env_truthy_or_default("P0_OSEMEETING_VISION_ENABLE", default=True)
+    )
+    if want_media:
         media_path, derr = _p0_ose_download_media(minute_token, workdir)
         if not media_path:
             logger.warning("p0 osemeeting recording download failed: %s", derr)
             notes.append(f"录像下载 / recording download: {derr}")
         else:
             duration = _p0_ose_media_duration(media_path)
-            segments, aerr = _p0_ose_openai_segments(media_path, workdir)
-            if segments:
-                turns: List[Dict[str, Any]] = []
-                srt_raw, serr = _p0_minutes_export(
-                    minute_token,
-                    {"need_speaker": "true", "need_timestamp": "true", "file_format": "srt"}, "srt")
-                if srt_raw:
-                    turns = _p0_srt_turns(srt_raw.decode("utf-8", "replace"))
-                else:
-                    logger.info("p0 osemeeting SRT export unavailable (%s) — no speaker names",
-                                serr.get("msg"))
-                named = [t for t in turns if (t.get("speaker") or "?") != "?"]
-                if named:
-                    return (_p0_ose_speakered(segments, turns, start_epoch),
-                            f"OpenAI ASR + Minutes speaker names "
-                            f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
-                            media_path, duration, notes)
-                # No speaker labels to borrow — still far better than nothing, just unattributed.
-                lines = [f"[{_p0_ose_hhmmss(s['start'], start_epoch)}] {s['text']}"
-                         for s in segments]
-                return ("\n".join(lines),
-                        f"OpenAI ASR, no speaker labels "
+    # No media means the download note above already explains it — fall through to the next rung.
+    if provider == "openai" and _p0_ose_openai_key() and media_path:
+        segments, aerr = _p0_ose_openai_segments(media_path, workdir)
+        if segments:
+            turns: List[Dict[str, Any]] = []
+            srt_raw, serr = _p0_minutes_export(
+                minute_token,
+                {"need_speaker": "true", "need_timestamp": "true", "file_format": "srt"}, "srt")
+            if srt_raw:
+                turns = _p0_srt_turns(srt_raw.decode("utf-8", "replace"))
+            else:
+                logger.info("p0 osemeeting SRT export unavailable (%s) — no speaker names",
+                            serr.get("msg"))
+            named = [t for t in turns if (t.get("speaker") or "?") != "?"]
+            if named:
+                return (_p0_ose_speakered(segments, turns, start_epoch),
+                        f"OpenAI ASR + Minutes speaker names "
                         f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
                         media_path, duration, notes)
-            logger.warning("p0 osemeeting OpenAI ASR failed — falling back: %s", aerr)
-            notes.append(f"OpenAI ASR: {aerr}")
+            # No speaker labels to borrow — still far better than nothing, just unattributed.
+            lines = [f"[{_p0_ose_hhmmss(s['start'], start_epoch)}] {s['text']}"
+                     for s in segments]
+            return ("\n".join(lines),
+                    f"OpenAI ASR, no speaker labels "
+                    f"({_cfg_str('P0_OSEMEETING_OPENAI_ASR_MODEL', 'whisper-1')})",
+                    media_path, duration, notes)
+        logger.warning("p0 osemeeting OpenAI ASR failed — falling back: %s", aerr)
+        notes.append(f"OpenAI ASR: {aerr}")
     elif provider == "openai":
         logger.info("p0 osemeeting: no OpenAI key configured — falling back to the local/Lark path")
         notes.append("OpenAI ASR: 未配置 API key / no API key "
@@ -12690,7 +13161,8 @@ def _p0_ose_transcript(minute_token: str, workdir: str,
 
     if provider in ("openai", "local") and _p0_whotalk_asr_enabled():
         text, aerr = _p0_whotalk_local_transcribe(minute_token, with_times=True,
-                                                  start_epoch=start_epoch)
+                                                  start_epoch=start_epoch,
+                                                  media_path_in=media_path)
         if text:
             return (text, f"本地识别 local ASR ({_p0_whotalk_asr_engine()})",
                     media_path, duration, notes)
@@ -12766,12 +13238,20 @@ def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key:
         if host_m and not meta.get("meeting minutes/recording link"):
             meta["meeting minutes/recording link"] = f"https://{host_m.group(1)}/minutes/{token}"
         meta.setdefault("meeting date", time.strftime("%Y/%m/%d"))
+        # Prefer the exact epoch; only fall back to re-parsing the minute-precision display string,
+        # which costs up to 59 s of skew on every timestamp the doc shows.
         start_epoch = 0.0
         try:
-            if meta.get("meeting start time"):
-                start_epoch = time.mktime(time.strptime(meta["meeting start time"], "%Y/%m/%d %H:%M"))
-        except (ValueError, OverflowError):
-            pass
+            start_epoch = float(meta.get("_start_epoch") or 0.0)
+        except (TypeError, ValueError):
+            start_epoch = 0.0
+        if not start_epoch:
+            try:
+                if meta.get("meeting start time"):
+                    start_epoch = time.mktime(
+                        time.strptime(meta["meeting start time"], "%Y/%m/%d %H:%M"))
+            except (ValueError, OverflowError):
+                pass
         if start_epoch:
             _shift, duty = _p0_duty_on(start_epoch)
             if duty:
@@ -12850,9 +13330,14 @@ def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key:
         done: Dict[str, Dict[str, int]] = {"en": dict(blank), "zh": dict(blank)}
         order = sorted((l for l in ("en", "zh") if layout["sections"][l]["found"]),
                        key=lambda l: layout["sections"][l]["insert_index"], reverse=True)
+        # Pictures go in ONE section (the same shot twice reads as noise) — English by preference,
+        # but the only section present if English is not one of them. Hard-wiring "en" meant a doc
+        # whose English heading did not match got no pictures anywhere.
+        img_lang = "en" if layout["sections"]["en"]["found"] else (
+            "zh" if layout["sections"]["zh"]["found"] else "")
         for lang in order:
             done[lang] = _p0_ose_write_section(document_id, layout, lang, topics, frames,
-                                               with_images=(lang == "en"))
+                                               with_images=(lang == img_lang))
         en, zh = done["en"], done["zh"]
 
         logger.info("p0 osemeeting done doc=%s topics=%d en=%s zh=%s overview=%d/%d images=%d "
@@ -12868,9 +13353,18 @@ def _p0_ose_worker(chat_id: str, open_id: str, arg: str, mid: str, debounce_key:
             f"**转写 transcript**: {len(transcript)} 字符 chars · {src}",
             f"**画面 vision**: {vision_note}",
         ]
-        if minutes.get("unplaced_frames"):
-            lines.append(f"**未归类截图 unplaced screenshots**: {len(minutes['unplaced_frames'])}"
-                         "（模型认为不属于任何议题 / the writer matched them to no topic）")
+        if minutes.get("auto_placed_frames"):
+            lines.append(f"**按时间自动归位的截图 auto-placed screenshots**: "
+                         f"{len(minutes['auto_placed_frames'])}"
+                         "（模型没给它们指定议题，已按时间就近插入 / the writer assigned them to no "
+                         "topic, so they were placed next to the nearest one by time）")
+        if minutes.get("note"):
+            # A repaired/truncated answer still writes a tidy-looking doc, so say so out loud.
+            lines.append(f"⚠️ **模型输出被修复 / model output repaired**: {minutes['note']}\n"
+                         "议题可能不完整——把 `P0_OSEMEETING_NUM_CTX` 调大或把 "
+                         "`P0_OSEMEETING_TRANSCRIPT_CHARS` 调小后重跑。/ Topics may be incomplete — "
+                         "raise `P0_OSEMEETING_NUM_CTX` or lower "
+                         "`P0_OSEMEETING_TRANSCRIPT_CHARS` and re-run.")
         failed = en["failed"] + zh["failed"] + ov_bad
         if failed:
             lines.append(f"⚠️ {failed} 处写入失败 / {failed} writes failed — journal 有详情 / see journal")
@@ -13165,7 +13659,7 @@ def _p0_vc_oauth_scopes() -> str:
         "P0_VC_OAUTH_SCOPES",
         "vc:rooms.room.detailinfo:read offline_access contact:contact.base:readonly "
         "contact:user.employee_id:readonly minutes:minutes.transcript:export "
-        "minutes:minutes.media:export",
+        "minutes:minutes.media:export minutes:minutes.basic:read",
     ).strip()
 
 
@@ -13375,7 +13869,9 @@ def _p0_vcauth_worker(kind: str, arg: str, rt: str, rv: str, debounce_key: str) 
                        "用法 / usage: `/vccode <code 或整个跳转网址 / the code, or the whole "
                        "redirected URL>`")
                 return
-            logger.info("p0 vcauth exchanging code=%r (from arg %r)", code[:8] + "…", arg[:80])
+            # Log the LENGTH only. The full value is a live single-use credential and journald
+            # is readable by anyone who can read the unit's logs.
+            logger.info("p0 vcauth exchanging an authorization code (%d chars)", len(code))
             ok, msg = _p0_vc_oauth_exchange(code)
             if ok:
                 _reply(
