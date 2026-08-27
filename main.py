@@ -12764,6 +12764,46 @@ def _p0_ose_text_block(kind: str, text: str) -> Dict[str, Any]:
             kind: {"elements": [{"text_run": {"content": text}}]}}
 
 
+def _p0_jpeg_size(path: str) -> Tuple[int, int]:
+    """(width, height) of a JPEG, read straight from its SOF marker; (0, 0) if unreadable.
+
+    Pure header parsing so the bot needs no imaging library. Worth doing because a docx image block
+    created without explicit dimensions is sized by Lark's own default rather than by the picture,
+    which is one way identical screenshots end up rendered at different sizes in the same document.
+    """
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(2) != b"\xff\xd8":
+                return 0, 0
+            while True:
+                b = fh.read(1)
+                while b and b != b"\xff":       # resync: padding bytes before a marker
+                    b = fh.read(1)
+                marker = fh.read(1)
+                while marker == b"\xff":        # fill bytes
+                    marker = fh.read(1)
+                if not marker:
+                    return 0, 0
+                m = marker[0]
+                if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:   # standalone markers, no payload
+                    continue
+                seg = fh.read(2)
+                if len(seg) < 2:
+                    return 0, 0
+                seglen = (seg[0] << 8) | seg[1]
+                # SOF0..SOF15 carry the frame size; C4/C8/CC are DHT/JPG/DAC, not frame headers.
+                if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                    body = fh.read(5)
+                    if len(body) < 5:
+                        return 0, 0
+                    h = (body[1] << 8) | body[2]
+                    w = (body[3] << 8) | body[4]
+                    return w, h
+                fh.seek(max(0, seglen - 2), os.SEEK_CUR)
+    except OSError:
+        return 0, 0
+
+
 def _p0_docx_delete_child(document_id: str, parent_id: str, index: int) -> bool:
     """Delete the child at ``index`` under ``parent_id``. Used to clean up an image block whose
     upload failed — left in place it renders as a broken placeholder in the doc."""
@@ -12799,8 +12839,16 @@ def _p0_docx_insert_image(document_id: str, parent_id: str, index: int,
     that, the caller's running index falls behind the parent's real child count and every later
     caption and image under the same heading lands one slot too early.
     """
+    # Give the block the picture's real dimensions instead of letting Lark pick a default —
+    # an unsized block renders at whatever size Lark falls back to, which is why otherwise
+    # identical 1280x720 screenshots could appear at different sizes in one document.
+    iw, ih = _p0_jpeg_size(jpg_path)
+    img_props: Dict[str, Any] = {"token": ""}
+    if iw > 0 and ih > 0:
+        img_props["width"] = iw
+        img_props["height"] = ih
     ids, err = _p0_docx_create_children(document_id, parent_id, index,
-                                        [{"block_type": 27, "image": {"token": ""}}])
+                                        [{"block_type": 27, "image": img_props}])
     if not ids or not ids[0]:
         return False, err or {"code": "NO_BLOCK", "msg": "image block not created"}, False
     img_block = ids[0]
@@ -12848,7 +12896,9 @@ def _p0_docx_insert_image(document_id: str, parent_id: str, index: int,
                 headers={"Authorization": f"Bearer {tok}",
                          "Content-Type": "application/json; charset=utf-8"},
                 params={"document_revision_id": -1},
-                json={"replace_image": {"token": file_token}},
+                json={"replace_image": (
+                    {"token": file_token, "width": iw, "height": ih}
+                    if iw > 0 and ih > 0 else {"token": file_token})},
                 timeout=30,
             )
             j = r.json()
